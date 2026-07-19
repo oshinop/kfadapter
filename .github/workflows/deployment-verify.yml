@@ -1,0 +1,101 @@
+name: Deployment verification
+
+on:
+  pull_request:
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - .dockerignore
+      - .gitignore
+      - deploy/**
+      - scripts/**
+      - .github/workflows/**
+      - go.mod
+      - go.sum
+      - cmd/**
+      - internal/**
+      - web/**
+  push:
+    branches: [main]
+    paths:
+      - Dockerfile
+      - compose.yaml
+      - .dockerignore
+      - .gitignore
+      - deploy/**
+      - scripts/**
+      - .github/workflows/**
+      - go.mod
+      - go.sum
+      - cmd/**
+      - internal/**
+      - web/**
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Go race and frontend tests
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '24'
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - name: Install frontend dependencies
+        working-directory: web
+        run: npm ci
+      - name: Build frontend
+        working-directory: web
+        run: npm run build
+      - name: Run frontend tests
+        working-directory: web
+        run: npm test -- --run
+      - uses: actions/setup-go@44694675825211faa026b3c33043df3e48a5fa00 # v6.0.0
+        with:
+          go-version: '1.26.5'
+      - name: Run Go unit and race tests
+        run: go test -race ./...
+
+  compose-contract:
+    name: Compose security contract
+    runs-on: ubuntu-24.04
+    env:
+      KFADAPTER_IMAGE_DIGEST: sha256:0000000000000000000000000000000000000000000000000000000000000000
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+      - name: Assert static deployment supply-chain contract
+        run: ./scripts/check-deployment-assets.sh
+      - name: Assert SQLite state filesystem safeguards
+        run: |
+          ./scripts/check-restore-state.sh
+          ./scripts/check-restore-commit.sh
+          ./scripts/check-backup-state.sh
+          ./scripts/check-upgrade.sh
+      - name: Validate production Compose interpolation
+        run: docker compose config --quiet
+      - name: Assert config-derived healthcheck
+        run: ./scripts/check-configured-healthcheck.sh
+      - name: Assert first-run and existing-volume preflight behavior
+        run: ./scripts/check-preflight.sh
+      - name: Validate deployment preflight
+        run: sudo --preserve-env=KFADAPTER_IMAGE_DIGEST ./scripts/preflight.sh
+      - name: Assert Compose isolation structure
+        run: ./scripts/check-compose-security.py --image-repository registry.invalid/kfadapter-override --image-digest "$KFADAPTER_IMAGE_DIGEST"
+
+
+  image-contract:
+    name: Alpine image contract
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build --build-arg VERSION=0.0.0-ci -t kfadapter:ci .
+      - name: Assert final image security structure
+        run: ./scripts/check-image-security.sh kfadapter:ci
+      - name: Prove local Compose first-run state initialization
+        run: ./scripts/check-local-compose-first-run.sh kfadapter:ci
+

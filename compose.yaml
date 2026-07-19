@@ -1,0 +1,46 @@
+name: kfadapter
+
+services:
+  kfadapter:
+    image: ghcr.io/oshinop/kfadapter:latest
+    ports:
+      - "127.0.0.1:10809:10809"
+      - "127.0.0.1:10808:10808"
+    user: "65532:65532"
+    working_dir: /kfadapter
+    init: true
+    read_only: true
+    restart: unless-stopped
+    stop_grace_period: 30s
+    environment:
+      TZ: "${KFADAPTER_TZ:-Asia/Shanghai}"
+    volumes:
+      - db_data:/kfadapter/data
+      - ./deploy/config.yml:/kfadapter/config.yml:ro
+    tmpfs:
+      - /tmp:rw,noexec,nosuid,nodev,size=16m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 256m
+    cpus: 1.0
+    ulimits:
+      nofile:
+        soft: 65536
+        hard: 65536
+    healthcheck:
+      test: ["CMD", "./kfadapter", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    logging:
+      driver: local
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  db_data:
