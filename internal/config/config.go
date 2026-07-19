@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/kfadapter/kfadapter/internal/endpoint"
 	"gopkg.in/yaml.v3"
 )
 
@@ -27,7 +28,7 @@ const (
 	maxSessionTTL             = 24 * time.Hour
 )
 
-// Duration is a YAML duration such as "15s" or "23h".
+// Duration is a YAML duration such as "15s" or "2h".
 type Duration time.Duration
 
 func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
@@ -45,15 +46,31 @@ func (d *Duration) UnmarshalYAML(node *yaml.Node) error {
 	return nil
 }
 
+func (d Duration) MarshalYAML() (any, error) { return d.Value().String(), nil }
+
 func (d Duration) Value() time.Duration { return time.Duration(d) }
 
+// Port is a canonical decimal TCP port.
+type Port uint16
+
+func (p *Port) UnmarshalYAML(node *yaml.Node) error {
+	if node.Kind != yaml.ScalarNode || node.Tag != "!!int" || !isCanonicalPort(node.Value) {
+		return errors.New("port must be a decimal integer between 1 and 65535")
+	}
+	value, _ := strconv.ParseUint(node.Value, 10, 16)
+	*p = Port(value)
+	return nil
+}
+
+func (p Port) String() string { return strconv.FormatUint(uint64(p), 10) }
+
 type Management struct {
-	Listen     string   `yaml:"listen"`
+	Port       Port     `yaml:"port"`
 	SessionTTL Duration `yaml:"sessionTTL"`
 }
 
 type Proxy struct {
-	Listen           string   `yaml:"listen"`
+	Port             Port     `yaml:"port"`
 	DialTimeout      Duration `yaml:"dialTimeout"`
 	HandshakeTimeout Duration `yaml:"handshakeTimeout"`
 }
@@ -64,21 +81,15 @@ type Provider struct {
 }
 
 type Config struct {
+	ListenAddr string     `yaml:"listenAddr"`
+	Hostname   string     `yaml:"hostname,omitempty"`
 	Management Management `yaml:"management"`
 	Proxy      Proxy      `yaml:"proxy"`
 	Provider   Provider   `yaml:"provider"`
 }
 
-func (c Config) ManagementAddress() string {
-	return loopbackAddress(c.Management.Listen)
-}
-
-func (c Config) ProxyAddress() string {
-	return loopbackAddress(c.Proxy.Listen)
-}
-
 func Load(path string) (Config, error) {
-	file, err := os.Open(path)
+	file, err := openOrCreate(path)
 	if err != nil {
 		return Config{}, fmt.Errorf("open configuration: %w", err)
 	}
@@ -109,39 +120,64 @@ func Load(path string) (Config, error) {
 	return cfg, nil
 }
 
+func Default() Config {
+	return Config{
+		ListenAddr: "127.0.0.1",
+		Management: Management{
+			Port: 10809, SessionTTL: Duration(30 * time.Minute),
+		},
+		Proxy: Proxy{
+			Port: 10808, DialTimeout: Duration(10 * time.Second), HandshakeTimeout: Duration(15 * time.Second),
+		},
+		Provider: Provider{
+			RequestTimeout: Duration(15 * time.Second), RefreshInterval: Duration(2 * time.Hour),
+		},
+	}
+}
+
+func (c Config) ManagementAddress() string {
+	return net.JoinHostPort(c.ListenAddr, c.Management.Port.String())
+}
+
+func (c Config) ProxyAddress() string { return net.JoinHostPort(c.ListenAddr, c.Proxy.Port.String()) }
+
 func (c *Config) applyDefaults() {
-	if c.Management.Listen == "" {
-		c.Management.Listen = "127.0.0.1:10809"
+	defaults := Default()
+	if c.ListenAddr == "" {
+		c.ListenAddr = defaults.ListenAddr
+	}
+	if c.Management.Port == 0 {
+		c.Management.Port = defaults.Management.Port
 	}
 	if c.Management.SessionTTL == 0 {
-		c.Management.SessionTTL = Duration(30 * time.Minute)
+		c.Management.SessionTTL = defaults.Management.SessionTTL
 	}
-	if c.Proxy.Listen == "" {
-		c.Proxy.Listen = "127.0.0.1:10808"
+	if c.Proxy.Port == 0 {
+		c.Proxy.Port = defaults.Proxy.Port
 	}
 	if c.Proxy.DialTimeout == 0 {
-		c.Proxy.DialTimeout = Duration(10 * time.Second)
+		c.Proxy.DialTimeout = defaults.Proxy.DialTimeout
 	}
 	if c.Proxy.HandshakeTimeout == 0 {
-		c.Proxy.HandshakeTimeout = Duration(15 * time.Second)
+		c.Proxy.HandshakeTimeout = defaults.Proxy.HandshakeTimeout
 	}
 	if c.Provider.RequestTimeout == 0 {
-		c.Provider.RequestTimeout = Duration(15 * time.Second)
+		c.Provider.RequestTimeout = defaults.Provider.RequestTimeout
 	}
 	if c.Provider.RefreshInterval == 0 {
-		c.Provider.RefreshInterval = Duration(23 * time.Hour)
+		c.Provider.RefreshInterval = defaults.Provider.RefreshInterval
 	}
 }
 
 func (c Config) Validate() error {
-	if err := validateListener("management.listen", c.Management.Listen); err != nil {
+	if err := validateListen("listenAddr", c.ListenAddr); err != nil {
 		return err
 	}
-	if err := validateListener("proxy.listen", c.Proxy.Listen); err != nil {
+	if err := validateHostname("hostname", c.Hostname); err != nil {
 		return err
 	}
-	if listenerPort(c.Management.Listen) == listenerPort(c.Proxy.Listen) {
-		return errors.New("management.listen and proxy.listen must use different ports")
+	if c.Management.Port == c.Proxy.Port {
+		return errors.New("management.port and proxy.port must be different")
 	}
 	if err := validateDurationRange("management.sessionTTL", c.Management.SessionTTL.Value(), minSessionTTL, maxSessionTTL); err != nil {
 		return err
@@ -161,55 +197,63 @@ func (c Config) Validate() error {
 	return nil
 }
 
-func loopbackAddress(listener string) string {
-	host, port, err := net.SplitHostPort(listener)
-	if err != nil {
-		return ""
+func openOrCreate(path string) (*os.File, error) {
+	file, err := os.Open(path)
+	if err == nil || !errors.Is(err, os.ErrNotExist) {
+		return file, err
 	}
-	if addr, err := netip.ParseAddr(host); err == nil && addr.IsLoopback() && addr.String() == host {
-		return listener
+	if err := writeDefault(path); err != nil {
+		if errors.Is(err, os.ErrExist) {
+			return os.Open(path)
+		}
+		return nil, fmt.Errorf("create default configuration: %w", err)
 	}
-	return net.JoinHostPort("127.0.0.1", port)
+	return os.Open(path)
 }
 
-func validateListener(name, address string) error {
-	if validateCanonicalLoopbackHostPort(name, address) == nil || isCanonicalWildcardHostPort(address) {
+func writeDefault(path string) error {
+	contents, err := yaml.Marshal(Default())
+	if err != nil {
+		return err
+	}
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = file.Close()
+			_ = os.Remove(path)
+		}
+	}()
+	if _, err := file.Write(contents); err != nil {
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		return err
+	}
+	if err := file.Close(); err != nil {
+		return err
+	}
+	keep = true
+	return nil
+}
+
+func validateListen(name, address string) error {
+	addr, err := netip.ParseAddr(address)
+	if err != nil || addr.String() != address {
+		return fmt.Errorf("%s must be a canonical numeric IP address", name)
+	}
+	return nil
+}
+
+func validateHostname(name, hostname string) error {
+	if hostname == "" {
 		return nil
 	}
-	return fmt.Errorf("%s must use a canonical numeric loopback or wildcard host:port", name)
-}
-
-func listenerPort(address string) string {
-	_, port, _ := net.SplitHostPort(address)
-	return port
-}
-
-func isCanonicalWildcardHostPort(address string) bool {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil || !isCanonicalPort(port) {
-		return false
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil || !addr.IsUnspecified() || addr.String() != host {
-		return false
-	}
-	return net.JoinHostPort(addr.String(), port) == address
-}
-
-func validateCanonicalLoopbackHostPort(name, address string) error {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil {
-		return fmt.Errorf("%s must use a canonical literal loopback host:port", name)
-	}
-	addr, err := netip.ParseAddr(host)
-	if err != nil || !addr.IsLoopback() || addr.String() != host {
-		return fmt.Errorf("%s must use a canonical literal loopback host:port", name)
-	}
-	if !isCanonicalPort(port) {
-		return fmt.Errorf("%s must use a canonical literal loopback host:port", name)
-	}
-	if net.JoinHostPort(addr.String(), port) != address {
-		return fmt.Errorf("%s must use a canonical literal loopback host:port", name)
+	if err := endpoint.ValidateHostname(hostname); err != nil {
+		return fmt.Errorf("%s %w", name, err)
 	}
 	return nil
 }

@@ -9,6 +9,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"os/signal"
 	"strings"
@@ -29,7 +30,7 @@ import (
 )
 
 const (
-	configPath     = "./config.yml"
+	configPath     = "./config.yaml"
 	stateDirectory = "./data"
 )
 
@@ -175,6 +176,9 @@ func newAdapter(cfg config.Config) (*adapter, error) {
 }
 
 func newAdapterAtStateDirectory(cfg config.Config, stateDirectory string) (result *adapter, err error) {
+	if err := validateListenInterface(cfg.ListenAddr); err != nil {
+		return nil, err
+	}
 	store, err := state.NewSQLiteStore(stateDirectory)
 	if err != nil {
 		return nil, err
@@ -268,7 +272,7 @@ func newAdapterAtStateDirectory(cfg config.Config, stateDirectory string) (resul
 		return nil, err
 	}
 	server, api, err := web.NewHTTPServer(web.Config{
-		ListenAddress: cfg.Management.Listen, PublicAddress: managementAddress,
+		Listen: managementAddress, Hostname: cfg.Hostname, SocksListen: proxyAddress,
 		Version: version, StartedAt: startedAt, SessionTTL: cfg.Management.SessionTTL.Value(),
 	}, web.Dependencies{Backend: runtimeFacade, Subscriptions: web.NewSubscriptionAdapter(subscriptionService), Sessions: store, Liveness: runtimeFacade})
 	if err != nil {
@@ -278,12 +282,66 @@ func newAdapterAtStateDirectory(cfg config.Config, stateDirectory string) (resul
 	if err != nil {
 		return nil, err
 	}
-	socksListener, err := net.Listen("tcp", cfg.Proxy.Listen)
+	socksListener, err := net.Listen("tcp", proxyAddress)
 	if err != nil {
 		_ = httpListener.Close()
 		return nil, err
 	}
 	return &adapter{runtime: runtimeFacade, manager: manager, store: store, httpServer: server, httpListener: httpListener, socksServer: socksServer, socksListener: socksListener, startupLog: os.Stdout, managementEndpoint: "http://" + managementAddress, proxyEndpoint: "socks5://" + proxyAddress}, nil
+}
+
+func validateListenInterface(listen string) error {
+	addresses, err := localInterfaceAddresses()
+	if err != nil {
+		return err
+	}
+	return validateListenInterfaceAddresses(listen, addresses)
+}
+
+func localInterfaceAddresses() ([]netip.Addr, error) {
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return nil, fmt.Errorf("inspect network interfaces: %w", err)
+	}
+	var result []netip.Addr
+	for _, networkInterface := range interfaces {
+		if networkInterface.Flags&net.FlagUp == 0 {
+			continue
+		}
+		addresses, err := networkInterface.Addrs()
+		if err != nil {
+			return nil, fmt.Errorf("inspect network interface %q: %w", networkInterface.Name, err)
+		}
+		for _, address := range addresses {
+			raw := address.String()
+			if slash := strings.LastIndexByte(raw, '/'); slash >= 0 {
+				raw = raw[:slash]
+			}
+			ip, err := netip.ParseAddr(raw)
+			if err == nil {
+				result = append(result, ip.WithZone("").Unmap())
+			}
+		}
+	}
+	return result, nil
+}
+
+func validateListenInterfaceAddresses(listen string, addresses []netip.Addr) error {
+	listenIP, err := netip.ParseAddr(listen)
+	if err != nil {
+		return fmt.Errorf("invalid listen address %q", listen)
+	}
+	listenIP = listenIP.Unmap()
+	for _, address := range addresses {
+		address = address.Unmap()
+		if address.Is4() == listenIP.Is4() && (listenIP.IsUnspecified() || address == listenIP) {
+			return nil
+		}
+	}
+	if listenIP.IsUnspecified() {
+		return fmt.Errorf("listen address %s has no reachable up local network interface of the same address family", listen)
+	}
+	return fmt.Errorf("listen address %s is not assigned to a reachable up local network interface", listen)
 }
 
 func configuredLocation() (*time.Location, error) {

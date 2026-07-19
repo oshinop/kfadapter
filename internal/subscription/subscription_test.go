@@ -37,6 +37,95 @@ func TestRenderDeterministicPaddedBase64AndEscaping(t *testing.T) {
 	}
 }
 
+func TestRenderAcceptsCanonicalAddresses(t *testing.T) {
+	for _, address := range []string{"0.0.0.0:10808", "192.0.2.10:10808", "[2001:db8::10]:10808", "adapter.example.com:10808"} {
+		t.Run(address, func(t *testing.T) {
+			body, count, err := Render([]Link{{Selector: "node", Password: "secret", Name: "Proxy", Eligible: true}}, address)
+			if err != nil || count != 1 {
+				t.Fatalf("Render = (%q, %d, %v)", body, count, err)
+			}
+			decoded, err := base64.StdEncoding.DecodeString(body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if got, want := string(decoded), "socks5://node:secret@"+address+"#Proxy\n"; got != want {
+				t.Fatalf("render = %q, want %q", got, want)
+			}
+		})
+	}
+}
+
+func TestSubscriptionUsesReachedHostForWildcardListener(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	service, store := newBoundTestServiceAt(t, &now, "account-one", "0.0.0.0:10808")
+	publish(t, service, testSnapshot("LAN"))
+	url, _, err := service.SubscriptionURL("http://192.0.2.10:10809")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := bindingFromURL(t, url)
+	request := httptest.NewRequest(http.MethodGet, url, nil)
+	response := httptest.NewRecorder()
+	service.ServeSubscriptionAt(response, request, binding, "192.0.2.10:10808")
+	if response.Code != http.StatusOK {
+		t.Fatalf("subscription response = %d", response.Code)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(response.Body.String())
+	if err != nil || !strings.Contains(string(decoded), "@192.0.2.10:10808#LAN") {
+		t.Fatalf("reached-host subscription = %q, %v", decoded, err)
+	}
+	secondURL, _, err := service.SubscriptionURL("http://198.51.100.20:10809")
+	if err != nil || bindingFromURL(t, secondURL) != binding {
+		t.Fatalf("stable multihomed URL = %q, %v", secondURL, err)
+	}
+	secondRequest := httptest.NewRequest(http.MethodGet, secondURL, nil)
+	secondResponse := httptest.NewRecorder()
+	service.ServeSubscriptionAt(secondResponse, secondRequest, binding, "198.51.100.20:10808")
+	secondDecoded, err := base64.StdEncoding.DecodeString(secondResponse.Body.String())
+	if err != nil || !strings.Contains(string(secondDecoded), "@198.51.100.20:10808#LAN") {
+		t.Fatalf("second reached-host subscription = %q, %v", secondDecoded, err)
+	}
+	persisted, err := store.Load()
+	if err != nil || persisted.LastGood.RenderedSubscription != secondResponse.Body.String() {
+		t.Fatalf("persisted reached-host body mismatch: %v", err)
+	}
+	restarted, err := NewService(ServiceConfig{Store: store, SocksAddress: "0.0.0.0:10808", Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.socksAddress != "198.51.100.20:10808" {
+		t.Fatalf("restarted SOCKS address = %q", restarted.socksAddress)
+	}
+}
+
+func TestSubscriptionUsesConfiguredHostname(t *testing.T) {
+	now := time.Date(2026, 7, 20, 12, 0, 0, 0, time.UTC)
+	service, store := newBoundTestServiceAt(t, &now, "account-one", "0.0.0.0:10808")
+	publish(t, service, testSnapshot("Hostname"))
+	url, _, err := service.SubscriptionURL("http://adapter.example.com:10809")
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := bindingFromURL(t, url)
+	request := httptest.NewRequest(http.MethodGet, url, nil)
+	response := httptest.NewRecorder()
+	service.ServeSubscriptionAt(response, request, binding, "adapter.example.com:10808")
+	if response.Code != http.StatusOK {
+		t.Fatalf("subscription response = %d", response.Code)
+	}
+	decoded, err := base64.StdEncoding.DecodeString(response.Body.String())
+	if err != nil || !strings.Contains(string(decoded), "@adapter.example.com:10808#Hostname") {
+		t.Fatalf("hostname subscription = %q, %v", decoded, err)
+	}
+	restarted, err := NewService(ServiceConfig{Store: store, SocksAddress: "0.0.0.0:10808", Now: func() time.Time { return now }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if restarted.socksAddress != "adapter.example.com:10808" {
+		t.Fatalf("restarted SOCKS address = %q", restarted.socksAddress)
+	}
+}
+
 func TestWriteSubscriptionBodyStreamsBoundedChunks(t *testing.T) {
 	body := strings.Repeat("x", subscriptionResponseChunkBytes*2+17)
 	writer := &chunkWriter{}
@@ -389,6 +478,10 @@ func TestValidatePersistentStateRejectsTamperedAuthority(t *testing.T) {
 }
 
 func newBoundTestService(t *testing.T, now *time.Time, account string) (*Service, *state.SQLiteStore) {
+	return newBoundTestServiceAt(t, now, account, "127.0.0.1:10808")
+}
+
+func newBoundTestServiceAt(t *testing.T, now *time.Time, account, socksAddress string) (*Service, *state.SQLiteStore) {
 	t.Helper()
 	directory := filepath.Join(t.TempDir(), "state")
 	if err := os.Mkdir(directory, 0o700); err != nil {
@@ -409,7 +502,7 @@ func newBoundTestService(t *testing.T, now *time.Time, account string) (*Service
 	if err := store.Save(persistent); err != nil {
 		t.Fatal(err)
 	}
-	service, err := NewService(ServiceConfig{Store: store, SocksAddress: "127.0.0.1:10808", Now: func() time.Time { return *now }})
+	service, err := NewService(ServiceConfig{Store: store, SocksAddress: socksAddress, Now: func() time.Time { return *now }})
 	if err != nil {
 		t.Fatal(err)
 	}

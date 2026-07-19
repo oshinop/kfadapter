@@ -19,6 +19,8 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
+
+	"github.com/kfadapter/kfadapter/internal/endpoint"
 )
 
 var (
@@ -33,18 +35,18 @@ type publicProblemError interface {
 	HTTPStatus() int
 }
 
-// Config defines the local HTTP boundary. ListenAddress is a canonical numeric
-// loopback or wildcard bind address. PublicAddress is the canonical numeric
-// loopback address shown to browsers and users.
+// Config defines the HTTP listener and optional DNS hostname accepted by the
+// browser boundary.
 type Config struct {
-	ListenAddress string
-	PublicAddress string
-	Version       string
-	StartedAt     time.Time
-	Now           func() time.Time
-	Random        io.Reader
-	SessionTTL    time.Duration
-	MaxSessions   int
+	Listen      string
+	Hostname    string
+	SocksListen string
+	Version     string
+	StartedAt   time.Time
+	Now         func() time.Time
+	Random      io.Reader
+	SessionTTL  time.Duration
+	MaxSessions int
 	// MaxConnections bounds all accepted local HTTP connections. Zero defaults
 	// to 128; values above 1024 are rejected.
 	MaxConnections int
@@ -109,8 +111,8 @@ type EventSource interface {
 // API has authenticated the browser session.
 type SubscriptionService interface {
 	Metadata(context.Context) (SubscriptionMetadata, error)
-	SubscriptionURL(context.Context, string) (SubscriptionURL, error)
-	ServeSubscription(http.ResponseWriter, *http.Request, string)
+	SubscriptionURL(context.Context, string, string) (SubscriptionURL, error)
+	ServeSubscription(http.ResponseWriter, *http.Request, string, string)
 }
 
 // AccessStatus is deliberately limited to initialization state. The API adds
@@ -230,27 +232,35 @@ type API struct {
 	backend       Backend
 	subscriptions SubscriptionService
 	liveness      Liveness
-	host          string
-	origin        string
+	listenIP      netip.Addr
+	listenPort    string
+	hostname      string
+	socksIP       netip.Addr
+	socksPort     string
 	sessions      *sessionStore
 	sseSlots      chan struct{}
 }
 
-// NewAPI creates a hardened browser handler. The browser endpoint is always
-// the exact canonical numeric loopback public address, even when the listener
-// is wildcard-bound for a container bridge.
+// NewAPI creates the browser handler for the configured listener.
 func NewAPI(config Config, dependencies Dependencies) (*API, error) {
-	if config.ListenAddress == "" {
-		config.ListenAddress = "127.0.0.1:10809"
+	if config.Listen == "" {
+		config.Listen = "127.0.0.1:10809"
 	}
-	if err := validateListenAddress(config.ListenAddress); err != nil {
-		return nil, err
+	listenIP, listenPort, err := canonicalNumericAddress(config.Listen)
+	if err != nil {
+		return nil, errors.New("listen must be a canonical numeric IP address and port")
 	}
-	if err := validateLoopbackHost(config.PublicAddress); err != nil {
-		return nil, err
+	if config.SocksListen == "" {
+		config.SocksListen = "127.0.0.1:10808"
 	}
-	if !sameListenerPort(config.ListenAddress, config.PublicAddress) {
-		return nil, errors.New("listen and public HTTP ports must match")
+	socksIP, socksPort, err := canonicalNumericAddress(config.SocksListen)
+	if err != nil {
+		return nil, errors.New("SOCKS listen must be a canonical numeric IP address and port")
+	}
+	if config.Hostname != "" {
+		if err := endpoint.ValidateHostname(config.Hostname); err != nil {
+			return nil, fmt.Errorf("hostname %w", err)
+		}
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -291,7 +301,8 @@ func NewAPI(config Config, dependencies Dependencies) (*API, error) {
 	}
 	return &API{
 		config: config, backend: dependencies.Backend, subscriptions: dependencies.Subscriptions,
-		liveness: dependencies.Liveness, host: config.PublicAddress, origin: "http://" + config.PublicAddress,
+		liveness: dependencies.Liveness, listenIP: listenIP, listenPort: listenPort, hostname: config.Hostname,
+		socksIP: socksIP, socksPort: socksPort,
 		sessions: sessions,
 		sseSlots: make(chan struct{}, config.SSEMaxClients),
 	}, nil
@@ -301,7 +312,7 @@ func NewAPI(config Config, dependencies Dependencies) (*API, error) {
 // subscription paths are never formatted into a log message.
 func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	setSecurityHeaders(w.Header())
-	if r.Host != a.host {
+	if !requestHostAllowed(a.listenIP, a.listenPort, a.hostname, r.Host) {
 		setNoStore(w.Header())
 		a.writeProblem(w, http.StatusBadRequest, "invalid_host", "Invalid Host", "")
 		return
@@ -316,7 +327,7 @@ func (a *API) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			writeEmptyNotFound(w)
 			return
 		}
-		a.subscriptions.ServeSubscription(w, r, binding)
+		a.subscriptions.ServeSubscription(w, r, binding, a.socksAddress(r))
 		return
 	}
 	if strings.HasPrefix(r.URL.Path, "/api/v1/") || r.URL.Path == "/api/v1" {
@@ -373,12 +384,12 @@ func (a *API) serveAPI(w http.ResponseWriter, r *http.Request) {
 		a.writeProblem(w, http.StatusUnauthorized, "not_authenticated", "Authentication required", "")
 		return
 	}
-	if r.URL.Path == "/api/v1/events" && !originAllowed(r.Header.Get("Origin"), a.origin) {
+	if r.URL.Path == "/api/v1/events" && !originAllowed(r.Header.Get("Origin"), "http://"+r.Host) {
 		a.writeProblem(w, http.StatusForbidden, "invalid_origin", "Invalid Origin", "")
 		return
 	}
 	if stateChanging(r.Method) {
-		if !originAllowed(r.Header.Get("Origin"), a.origin) {
+		if !originAllowed(r.Header.Get("Origin"), "http://"+r.Host) {
 			a.writeProblem(w, http.StatusForbidden, "invalid_origin", "Invalid Origin", "")
 			return
 		}
@@ -452,7 +463,7 @@ func (a *API) access(w http.ResponseWriter, r *http.Request, setup bool) {
 		a.backendUnavailable(w)
 		return
 	}
-	if !originAllowed(r.Header.Get("Origin"), a.origin) {
+	if !originAllowed(r.Header.Get("Origin"), "http://"+r.Host) {
 		a.writeProblem(w, http.StatusForbidden, "invalid_origin", "Invalid Origin", "")
 		return
 	}
@@ -537,6 +548,7 @@ func (a *API) status(w http.ResponseWriter, r *http.Request) {
 		}
 		status.Subscription = metadata
 	}
+	status.DataPlane.SocksAddress = a.socksAddress(r)
 	a.writeJSON(w, http.StatusOK, status)
 }
 
@@ -569,6 +581,7 @@ func (a *API) nodeDetails(w http.ResponseWriter, r *http.Request, id string) {
 		a.writeBackendError(w, err, "node_details_unavailable", http.StatusServiceUnavailable)
 		return
 	}
+	details.SocksAddress = a.socksAddress(r)
 	a.writeJSON(w, http.StatusOK, details)
 }
 
@@ -704,7 +717,7 @@ func (a *API) subscriptionURL(w http.ResponseWriter, r *http.Request) {
 		a.writeProblem(w, http.StatusServiceUnavailable, "subscription_unavailable", "Subscription unavailable", "")
 		return
 	}
-	subscriptionURL, err := a.subscriptions.SubscriptionURL(r.Context(), a.baseURL())
+	subscriptionURL, err := a.subscriptions.SubscriptionURL(r.Context(), a.baseURL(r.Host), a.socksAddress(r))
 	if err != nil {
 		a.writeBackendError(w, err, "subscription_unavailable", http.StatusServiceUnavailable)
 		return
@@ -919,44 +932,75 @@ func (a *API) backendUnavailable(w http.ResponseWriter) {
 	a.writeProblem(w, http.StatusServiceUnavailable, "service_unavailable", "Service unavailable", "")
 }
 
-func (a *API) baseURL() string { return "http://" + a.config.PublicAddress }
-
-func validateLoopbackHost(hostport string) error {
-	ip, err := canonicalNumericAddress(hostport)
-	if err != nil || !ip.IsLoopback() {
-		return errors.New("public address must be a canonical numeric loopback address with a port")
+func (a *API) baseURL(requestHost string) string {
+	if hostname, ok := a.advertisedHostname(requestHost); ok {
+		if a.listenPort == "80" {
+			return "http://" + hostname
+		}
+		return "http://" + net.JoinHostPort(hostname, a.listenPort)
 	}
-	return nil
+	return "http://" + requestHost
 }
 
-func validateListenAddress(hostport string) error {
-	ip, err := canonicalNumericAddress(hostport)
-	if err != nil || (!ip.IsLoopback() && !ip.IsUnspecified()) {
-		return errors.New("listen address must be a canonical numeric loopback or wildcard address with a port")
-	}
-	return nil
+func (a *API) advertisedHostname(requestHost string) (string, bool) {
+	return acceptedHostname(a.listenIP, a.listenPort, a.hostname, requestHost)
 }
 
-func canonicalNumericAddress(hostport string) (netip.Addr, error) {
+func (a *API) socksAddress(r *http.Request) string {
+	if hostname, ok := a.advertisedHostname(r.Host); ok {
+		return net.JoinHostPort(hostname, a.socksPort)
+	}
+	if !a.socksIP.IsUnspecified() {
+		return a.config.SocksListen
+	}
+	host, _, err := net.SplitHostPort(r.Host)
+	if err != nil && a.listenPort == "80" {
+		host = r.Host
+	}
+	if requestIP, err := netip.ParseAddr(host); err == nil && requestIP.Is4() == a.socksIP.Is4() {
+		return net.JoinHostPort(host, a.socksPort)
+	}
+	return a.config.SocksListen
+}
+
+func requestHostAllowed(listenIP netip.Addr, listenPort, hostname, requestHost string) bool {
+	requestIP, requestPort, err := canonicalNumericAddress(requestHost)
+	if err == nil && requestPort == listenPort && (requestIP == listenIP || listenIP.IsUnspecified() && requestIP.Is4() == listenIP.Is4()) {
+		return true
+	}
+	_, ok := acceptedHostname(listenIP, listenPort, hostname, requestHost)
+	return ok
+}
+
+func acceptedHostname(listenIP netip.Addr, listenPort, configuredHostname, requestHost string) (string, bool) {
+	if configuredHostname != "" && hostnameMatches(configuredHostname, listenPort, requestHost) {
+		return configuredHostname, true
+	}
+	if (listenIP.IsUnspecified() || listenIP.IsLoopback()) && hostnameMatches("localhost", listenPort, requestHost) {
+		return "localhost", true
+	}
+	return "", false
+}
+
+func hostnameMatches(hostname, listenPort, requestHost string) bool {
+	return strings.EqualFold(requestHost, net.JoinHostPort(hostname, listenPort)) ||
+		listenPort == "80" && strings.EqualFold(requestHost, hostname)
+}
+
+func canonicalNumericAddress(hostport string) (netip.Addr, string, error) {
 	host, port, err := net.SplitHostPort(hostport)
 	if err != nil || host == "" || port == "" {
-		return netip.Addr{}, errors.New("host and port are required")
+		return netip.Addr{}, "", errors.New("host and port are required")
 	}
 	parsedPort, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || strconv.FormatUint(parsedPort, 10) != port {
-		return netip.Addr{}, errors.New("port must be canonical")
+	if err != nil || parsedPort == 0 || strconv.FormatUint(parsedPort, 10) != port {
+		return netip.Addr{}, "", errors.New("port must be canonical")
 	}
 	ip, err := netip.ParseAddr(host)
 	if err != nil || ip.String() != host {
-		return netip.Addr{}, errors.New("address must be canonical")
+		return netip.Addr{}, "", errors.New("address must be canonical")
 	}
-	return ip, nil
-}
-
-func sameListenerPort(listenAddress, publicAddress string) bool {
-	_, listenPort, listenErr := net.SplitHostPort(listenAddress)
-	_, publicPort, publicErr := net.SplitHostPort(publicAddress)
-	return listenErr == nil && publicErr == nil && listenPort == publicPort
+	return ip, port, nil
 }
 
 func subscriptionPath(requestPath string) (string, bool) {

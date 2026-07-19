@@ -23,7 +23,7 @@ const (
 )
 
 func testConfig() Config {
-	return Config{ListenAddress: testHost, PublicAddress: testHost}
+	return Config{Listen: testHost}
 }
 
 type publicError struct {
@@ -165,13 +165,13 @@ func newFakeSubscriptions() *fakeSubscriptions {
 func (s *fakeSubscriptions) Metadata(context.Context) (SubscriptionMetadata, error) {
 	return s.metadata, nil
 }
-func (s *fakeSubscriptions) SubscriptionURL(_ context.Context, baseURL string) (SubscriptionURL, error) {
+func (s *fakeSubscriptions) SubscriptionURL(_ context.Context, baseURL, _ string) (SubscriptionURL, error) {
 	s.mu.Lock()
 	s.urlCalls++
 	s.mu.Unlock()
 	return SubscriptionURL{URL: strings.TrimRight(baseURL, "/") + "/sub/" + s.binding, Generation: s.metadata.Generation}, nil
 }
-func (s *fakeSubscriptions) ServeSubscription(w http.ResponseWriter, _ *http.Request, binding string) {
+func (s *fakeSubscriptions) ServeSubscription(w http.ResponseWriter, _ *http.Request, binding, _ string) {
 	if binding != s.binding {
 		writeEmptyNotFound(w)
 		return
@@ -190,41 +190,206 @@ func newTestAPI(t *testing.T, backend *fakeBackend, subscriptions *fakeSubscript
 	return api
 }
 
-func TestAPIEndpointPolicyIsExactAndDerived(t *testing.T) {
-	api, err := NewAPI(Config{ListenAddress: "0.0.0.0:10809", PublicAddress: testHost}, Dependencies{Backend: &fakeBackend{}})
+func TestAPIWildcardAndHostnamePolicy(t *testing.T) {
+	const wildcardHost = "0.0.0.0:10809"
+	api, err := NewAPI(Config{Listen: wildcardHost, Hostname: "adapter.example.com"}, Dependencies{Backend: &fakeBackend{}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if api.baseURL() != testOrigin {
-		t.Fatalf("subscription base URL = %q, want %q", api.baseURL(), testOrigin)
+	const remoteHost = "192.0.2.10:10809"
+	if got, want := api.baseURL(remoteHost), "http://"+remoteHost; got != want {
+		t.Fatalf("subscription base URL = %q, want %q", got, want)
 	}
 
-	badHost := httptest.NewRequest(http.MethodGet, "http://"+testHost+"/healthz", nil)
-	badHost.Host = "localhost:10809"
-	badHostResponse := httptest.NewRecorder()
-	api.ServeHTTP(badHostResponse, badHost)
-	if badHostResponse.Code != http.StatusBadRequest {
-		t.Fatalf("non-public Host = %d", badHostResponse.Code)
+	for _, host := range []string{wildcardHost, testHost, remoteHost, "localhost:10809", "LOCALHOST:10809", "adapter.example.com:10809", "ADAPTER.EXAMPLE.COM:10809"} {
+		request := httptest.NewRequest(http.MethodGet, "http://"+host+"/healthz", nil)
+		request.Host = host
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, request)
+		if response.Code != http.StatusOK {
+			t.Fatalf("Host %q = %d: %s", host, response.Code, response.Body.String())
+		}
 	}
-	if malformedOrigin := request(api, http.MethodPost, "/api/v1/access/setup", `{"token":"`+validTestToken+`"}`, nil, testOrigin+"/"); malformedOrigin.Code != http.StatusForbidden {
+	for _, host := range []string{"192.0.2.10:10810", "[::1]:10809"} {
+		request := httptest.NewRequest(http.MethodGet, "http://"+host+"/healthz", nil)
+		request.Host = host
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, request)
+		if response.Code != http.StatusBadRequest {
+			t.Fatalf("invalid Host %q = %d", host, response.Code)
+		}
+	}
+
+	if got := api.baseURL("LOCALHOST:10809"); got != "http://localhost:10809" {
+		t.Fatalf("localhost base URL = %q", got)
+	}
+	localhostRequest := httptest.NewRequest(http.MethodGet, "http://localhost:10809/", nil)
+	if got := api.socksAddress(localhostRequest); got != "localhost:10808" {
+		t.Fatalf("localhost SOCKS address = %q", got)
+	}
+	loopback, err := NewAPI(Config{Listen: testHost}, Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loopbackRequest := httptest.NewRequest(http.MethodGet, "http://localhost:10809/healthz", nil)
+	loopbackResponse := httptest.NewRecorder()
+	loopback.ServeHTTP(loopbackResponse, loopbackRequest)
+	if loopbackResponse.Code != http.StatusOK {
+		t.Fatalf("loopback listener rejected implicit localhost: %d", loopbackResponse.Code)
+	}
+	specific, err := NewAPI(Config{Listen: "192.0.2.10:10809"}, Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	specificRequest := httptest.NewRequest(http.MethodGet, "http://localhost:10809/healthz", nil)
+	specificResponse := httptest.NewRecorder()
+	specific.ServeHTTP(specificResponse, specificRequest)
+	if specificResponse.Code != http.StatusBadRequest {
+		t.Fatalf("non-loopback listener accepted implicit localhost: %d", specificResponse.Code)
+	}
+
+	setup := func(origin string) *httptest.ResponseRecorder {
+		request := httptest.NewRequest(http.MethodPost, "http://"+remoteHost+"/api/v1/access/setup", strings.NewReader(`{"token":"`+validTestToken+`"}`))
+		request.Host = remoteHost
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set("Origin", origin)
+		response := httptest.NewRecorder()
+		api.ServeHTTP(response, request)
+		return response
+	}
+	if malformedOrigin := setup("http://" + remoteHost + "/"); malformedOrigin.Code != http.StatusForbidden {
 		t.Fatalf("malformed Origin = %d", malformedOrigin.Code)
 	}
-	if exactOrigin := request(api, http.MethodPost, "/api/v1/access/setup", `{"token":"`+validTestToken+`"}`, nil, testOrigin); exactOrigin.Code != http.StatusCreated {
+	if exactOrigin := setup("http://" + remoteHost); exactOrigin.Code != http.StatusCreated {
 		t.Fatalf("exact Origin = %d: %s", exactOrigin.Code, exactOrigin.Body.String())
 	}
 }
 
-func TestAPIEndpointConfigurationRejectsNoncanonicalOrPublicMismatch(t *testing.T) {
+func TestAPIEndpointConfiguration(t *testing.T) {
+	for _, listen := range []string{"127.0.0.1:10809", "192.0.2.10:10809", "[2001:db8::1]:10809"} {
+		if _, err := NewAPI(Config{Listen: listen}, Dependencies{}); err != nil {
+			t.Fatalf("NewAPI(%q): %v", listen, err)
+		}
+	}
 	for _, config := range []Config{
-		{ListenAddress: "localhost:10809", PublicAddress: testHost},
-		{ListenAddress: "127.0.0.1:010809", PublicAddress: testHost},
-		{ListenAddress: testHost, PublicAddress: ""},
-		{ListenAddress: testHost, PublicAddress: "localhost:10809"},
-		{ListenAddress: testHost, PublicAddress: "127.0.0.1:10810"},
+		{Listen: "localhost:10809"},
+		{Listen: "127.0.0.1:010809"},
+		{Listen: testHost, Hostname: "http://adapter.example.com"},
+		{Listen: testHost, Hostname: "adapter.example.com:10809"},
 	} {
 		if _, err := NewAPI(config, Dependencies{}); err == nil {
 			t.Fatalf("NewAPI(%#v) accepted invalid endpoint policy", config)
 		}
+	}
+}
+
+func TestAPIDerivesWildcardSocksAddressFromReachedHost(t *testing.T) {
+	api, err := NewAPI(Config{Listen: "0.0.0.0:10809", SocksListen: "0.0.0.0:10808", Hostname: "adapter.example.com"}, Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, host := range []string{"192.0.2.10", "198.51.100.20"} {
+		numeric := httptest.NewRequest(http.MethodGet, "http://"+host+":10809/", nil)
+		if got := api.socksAddress(numeric); got != host+":10808" {
+			t.Fatalf("numeric reached address = %q", got)
+		}
+	}
+	hostname := httptest.NewRequest(http.MethodGet, "http://adapter.example.com:10809/", nil)
+	if got := api.socksAddress(hostname); got != "adapter.example.com:10808" {
+		t.Fatalf("hostname SOCKS address = %q", got)
+	}
+	if got := api.baseURL("ADAPTER.EXAMPLE.COM:10809"); got != "http://adapter.example.com:10809" {
+		t.Fatalf("hostname base URL = %q", got)
+	}
+	numeric := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:10809/", nil)
+	specific, err := NewAPI(Config{Listen: "0.0.0.0:10809", SocksListen: "192.0.2.20:10808"}, Dependencies{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := specific.socksAddress(numeric); got != "192.0.2.20:10808" {
+		t.Fatalf("specific SOCKS address = %q", got)
+	}
+}
+
+func TestAPIAdvertisesHostnameUsedByRequest(t *testing.T) {
+	subscriptions := newFakeSubscriptions()
+	api, err := NewAPI(Config{Listen: "0.0.0.0:10809", SocksListen: "0.0.0.0:10808", Hostname: "adapter.example.com"}, Dependencies{Backend: &fakeBackend{}, Subscriptions: subscriptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, _ := establish(t, api)
+
+	statusRequest := httptest.NewRequest(http.MethodGet, "http://adapter.example.com:10809/api/v1/status", nil)
+	statusRequest.Host = "adapter.example.com:10809"
+	statusRequest.AddCookie(cookie)
+	statusResponse := httptest.NewRecorder()
+	api.ServeHTTP(statusResponse, statusRequest)
+	if statusResponse.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", statusResponse.Code, statusResponse.Body.String())
+	}
+	var status Status
+	if err := json.Unmarshal(statusResponse.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.DataPlane.SocksAddress != "adapter.example.com:10808" {
+		t.Fatalf("advertised SOCKS address = %q", status.DataPlane.SocksAddress)
+	}
+
+	urlRequest := httptest.NewRequest(http.MethodGet, "http://ADAPTER.EXAMPLE.COM:10809/api/v1/subscription/url", nil)
+	urlRequest.Host = "ADAPTER.EXAMPLE.COM:10809"
+	urlRequest.AddCookie(cookie)
+	urlResponse := httptest.NewRecorder()
+	api.ServeHTTP(urlResponse, urlRequest)
+	if urlResponse.Code != http.StatusOK {
+		t.Fatalf("subscription URL = %d: %s", urlResponse.Code, urlResponse.Body.String())
+	}
+	var subscriptionURL SubscriptionURL
+	if err := json.Unmarshal(urlResponse.Body.Bytes(), &subscriptionURL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(subscriptionURL.URL, "http://adapter.example.com:10809/sub/") {
+		t.Fatalf("advertised subscription URL = %q", subscriptionURL.URL)
+	}
+}
+
+func TestAPIAdvertisesImplicitLocalhost(t *testing.T) {
+	subscriptions := newFakeSubscriptions()
+	api, err := NewAPI(Config{Listen: "0.0.0.0:10809", SocksListen: "0.0.0.0:10808"}, Dependencies{Backend: &fakeBackend{}, Subscriptions: subscriptions})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie, _ := establish(t, api)
+
+	statusRequest := httptest.NewRequest(http.MethodGet, "http://LOCALHOST:10809/api/v1/status", nil)
+	statusRequest.Host = "LOCALHOST:10809"
+	statusRequest.AddCookie(cookie)
+	statusResponse := httptest.NewRecorder()
+	api.ServeHTTP(statusResponse, statusRequest)
+	if statusResponse.Code != http.StatusOK {
+		t.Fatalf("status = %d: %s", statusResponse.Code, statusResponse.Body.String())
+	}
+	var status Status
+	if err := json.Unmarshal(statusResponse.Body.Bytes(), &status); err != nil {
+		t.Fatal(err)
+	}
+	if status.DataPlane.SocksAddress != "localhost:10808" {
+		t.Fatalf("advertised SOCKS address = %q", status.DataPlane.SocksAddress)
+	}
+
+	urlRequest := httptest.NewRequest(http.MethodGet, "http://localhost:10809/api/v1/subscription/url", nil)
+	urlRequest.Host = "localhost:10809"
+	urlRequest.AddCookie(cookie)
+	urlResponse := httptest.NewRecorder()
+	api.ServeHTTP(urlResponse, urlRequest)
+	if urlResponse.Code != http.StatusOK {
+		t.Fatalf("subscription URL = %d: %s", urlResponse.Code, urlResponse.Body.String())
+	}
+	var subscriptionURL SubscriptionURL
+	if err := json.Unmarshal(urlResponse.Body.Bytes(), &subscriptionURL); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(subscriptionURL.URL, "http://localhost:10809/sub/") {
+		t.Fatalf("advertised subscription URL = %q", subscriptionURL.URL)
 	}
 }
 
@@ -614,10 +779,17 @@ func TestNodeDetailsReturnsOnlyLocalCredentials(t *testing.T) {
 	}
 }
 
-func TestStatusOmitsRemovedConnectionCounters(t *testing.T) {
-	api := newTestAPI(t, &fakeBackend{}, newFakeSubscriptions())
+func TestStatusUsesReachedLANAddress(t *testing.T) {
+	api, err := NewAPI(Config{Listen: "0.0.0.0:10809", SocksListen: "0.0.0.0:10808"}, Dependencies{Backend: &fakeBackend{}, Subscriptions: newFakeSubscriptions()})
+	if err != nil {
+		t.Fatal(err)
+	}
 	cookie, _ := establish(t, api)
-	response := request(api, http.MethodGet, "/api/v1/status", "", cookie, "")
+	statusRequest := httptest.NewRequest(http.MethodGet, "http://192.0.2.10:10809/api/v1/status", nil)
+	statusRequest.Host = "192.0.2.10:10809"
+	statusRequest.AddCookie(cookie)
+	response := httptest.NewRecorder()
+	api.ServeHTTP(response, statusRequest)
 	if response.Code != http.StatusOK {
 		t.Fatalf("status = %d: %s", response.Code, response.Body.String())
 	}
@@ -626,6 +798,10 @@ func TestStatusOmitsRemovedConnectionCounters(t *testing.T) {
 	}
 	if err := json.Unmarshal(response.Body.Bytes(), &raw); err != nil {
 		t.Fatal(err)
+	}
+	var socksAddress string
+	if err := json.Unmarshal(raw.DataPlane["socksAddress"], &socksAddress); err != nil || socksAddress != "192.0.2.10:10808" {
+		t.Fatalf("status SOCKS address = %q, %v", socksAddress, err)
 	}
 	for _, field := range []string{"activeTcp", "activeUdpAssociations"} {
 		if _, present := raw.DataPlane[field]; present {

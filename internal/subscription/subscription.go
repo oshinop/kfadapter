@@ -6,11 +6,14 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/kfadapter/kfadapter/internal/endpoint"
 )
 
 const (
@@ -22,7 +25,7 @@ var (
 	ErrNoEligibleLinks         = errors.New("subscription has no eligible links")
 	ErrRenderedTooLarge        = errors.New("subscription exceeds response size limit")
 	ErrSubscriptionUnavailable = errors.New("subscription is not activated")
-	ErrInvalidLoopbackAddress  = errors.New("subscription SOCKS address is not numeric loopback")
+	ErrInvalidAddress          = errors.New("subscription SOCKS address must contain a canonical numeric IP address and port")
 )
 
 // Link is the non-secret presentation data required to render one local SOCKS URI.
@@ -48,7 +51,7 @@ type Metadata struct {
 
 // Render emits padded Base64 of deterministic newline-delimited SOCKS5 links.
 func Render(links []Link, socksAddress string) (string, int, error) {
-	host, port, err := parseLoopbackAddress(socksAddress)
+	host, port, err := parseAddress(socksAddress)
 	if err != nil {
 		return "", 0, err
 	}
@@ -90,24 +93,27 @@ func Render(links []Link, socksAddress string) (string, int, error) {
 	return encoded, len(eligible), nil
 }
 
-func parseLoopbackAddress(address string) (string, string, error) {
+func parseAddress(address string) (string, string, error) {
 	host, port, err := net.SplitHostPort(address)
 	if err != nil {
-		return "", "", ErrInvalidLoopbackAddress
-	}
-	ip := net.ParseIP(host)
-	if ip == nil || !ip.IsLoopback() {
-		return "", "", ErrInvalidLoopbackAddress
+		return "", "", ErrInvalidAddress
 	}
 	portNumber, err := strconv.ParseUint(port, 10, 16)
 	if err != nil || portNumber == 0 || strconv.FormatUint(portNumber, 10) != port {
-		return "", "", ErrInvalidLoopbackAddress
+		return "", "", ErrInvalidAddress
 	}
-	return ip.String(), port, nil
+	ip, err := netip.ParseAddr(host)
+	if err == nil && ip.Zone() == "" && ip.String() == host {
+		return ip.String(), port, nil
+	}
+	if endpoint.ValidateHostname(host) != nil {
+		return "", "", ErrInvalidAddress
+	}
+	return host, port, nil
 }
 
-func validateLoopbackAddress(address string) error {
-	_, _, err := parseLoopbackAddress(address)
+func validateAddress(address string) error {
+	_, _, err := parseAddress(address)
 	return err
 }
 

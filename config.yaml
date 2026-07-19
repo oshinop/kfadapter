@@ -1,0 +1,33 @@
+# Paths are fixed relative to /kfadapter: configuration is ./config.yaml and
+# persistent SQLite data is ./data. Provider requests use https://ws.kuaifan.co.
+
+# Shared numeric listener address for management and SOCKS. Production host
+# networking makes OpenWrt interface addresses directly bindable. A specific
+# address must be assigned to an up local interface; wildcard selects all up
+# interfaces of its address family.
+listenAddr: 0.0.0.0
+
+# Optional DNS hostname accepted and advertised; localhost is implicitly accepted
+# when listenAddr is wildcard or loopback.
+# hostname: adapter.example.com
+
+# Management HTTP endpoint.
+management:
+  port: 10809
+  # Lifetime of an authenticated browser session (valid range: 1m through 24h).
+  sessionTTL: 30m
+
+# SOCKS proxy endpoint and upstream connection limits.
+proxy:
+  port: 10808
+  # Timeout for opening an upstream connection (valid range: 1s through 10s).
+  dialTimeout: 10s
+  # Timeout for the upstream protocol handshake (valid range: 1s through 1m).
+  handshakeTimeout: 15s
+
+# Provider API request and refresh scheduling; its origin is fixed above.
+provider:
+  # Per-request timeout (valid range: 1s through 15s).
+  requestTimeout: 15s
+  # Background refresh cadence (valid range: 15m through 24h).
+  refreshInterval: 2h

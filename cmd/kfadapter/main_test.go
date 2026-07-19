@@ -7,6 +7,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,7 +82,7 @@ func TestHealthcheckUsesWorkingDirectoryConfig(t *testing.T) {
 	}
 }
 
-func TestHealthcheckDerivesLoopbackFromWildcardListeners(t *testing.T) {
+func TestHealthcheckUsesConfiguredWildcardListeners(t *testing.T) {
 	managementListener, err := net.Listen("tcp", "0.0.0.0:0")
 	if err != nil {
 		t.Fatal(err)
@@ -117,7 +118,7 @@ func TestHealthcheckDerivesLoopbackFromWildcardListeners(t *testing.T) {
 	select {
 	case <-accepted:
 	case <-time.After(time.Second):
-		t.Fatal("healthcheck did not probe the derived loopback proxy endpoint")
+		t.Fatal("healthcheck did not probe the configured wildcard proxy endpoint")
 	}
 }
 
@@ -138,6 +139,44 @@ func TestValidateConfigUsesWorkingDirectory(t *testing.T) {
 	}
 }
 
+func TestValidateConfigCreatesDefaultFile(t *testing.T) {
+	t.Chdir(t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := run([]string{"validate-config"}, &stdout, &stderr); code != 0 || stdout.String() != "configuration valid\n" || stderr.Len() != 0 {
+		t.Fatalf("validate-config result code=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
+	}
+	info, err := os.Stat(configPath)
+	if err != nil {
+		t.Fatalf("stat default config: %v", err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("default config mode = %s", info.Mode())
+	}
+}
+
+func TestValidateListenInterfaceAddresses(t *testing.T) {
+	tests := []struct {
+		name      string
+		listen    string
+		addresses []netip.Addr
+		wantError bool
+	}{
+		{name: "assigned IPv4", listen: "192.0.2.10", addresses: []netip.Addr{netip.MustParseAddr("192.0.2.10")}},
+		{name: "unassigned IPv4", listen: "192.0.2.20", addresses: []netip.Addr{netip.MustParseAddr("192.0.2.10")}, wantError: true},
+		{name: "IPv4 wildcard", listen: "0.0.0.0", addresses: []netip.Addr{netip.MustParseAddr("127.0.0.1")}},
+		{name: "IPv4 wildcard without IPv4 NIC", listen: "0.0.0.0", addresses: []netip.Addr{netip.MustParseAddr("::1")}, wantError: true},
+		{name: "IPv6 wildcard", listen: "::", addresses: []netip.Addr{netip.MustParseAddr("::1")}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			err := validateListenInterfaceAddresses(test.listen, test.addresses)
+			if (err != nil) != test.wantError {
+				t.Fatalf("validation error = %v, wantError %t", err, test.wantError)
+			}
+		})
+	}
+}
+
 func TestVersionCommandPrintsOnlyVersion(t *testing.T) {
 	previous := version
 	version = "1.2.3"
@@ -152,7 +191,12 @@ func TestVersionCommandPrintsOnlyVersion(t *testing.T) {
 func writeWorkingConfig(t *testing.T, managementAddress, proxyAddress string) {
 	t.Helper()
 	t.Chdir(t.TempDir())
-	body := "management:\n  listen: \"" + managementAddress + "\"\nproxy:\n  listen: \"" + proxyAddress + "\"\n"
+	management := netip.MustParseAddrPort(managementAddress)
+	proxy := netip.MustParseAddrPort(proxyAddress)
+	if management.Addr() != proxy.Addr() {
+		t.Fatalf("test listeners do not share an address: %s and %s", managementAddress, proxyAddress)
+	}
+	body := "listenAddr: \"" + management.Addr().String() + "\"\nmanagement:\n  port: " + config.Port(management.Port()).String() + "\nproxy:\n  port: " + config.Port(proxy.Port()).String() + "\n"
 	if err := os.WriteFile(configPath, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -317,6 +361,45 @@ func TestNewAdapterBindsBridgeWildcardListeners(t *testing.T) {
 			t.Fatalf("%s listener = %q, want wildcard port %q", listener.name, listener.value.Addr(), listener.port)
 		}
 	}
+	var startup bytes.Buffer
+	adapter.startupLog = &startup
+	ctx, cancel := context.WithCancel(context.Background())
+	finished := make(chan error, 1)
+	go func() { finished <- adapter.runContext(ctx) }()
+
+	request, err := http.NewRequest(http.MethodGet, "http://127.0.0.1:"+managementPort+"/healthz", nil)
+	if err != nil {
+		cancel()
+		t.Fatal(err)
+	}
+	request.Host = "0.0.0.0:" + managementPort
+	response, requestErr := (&http.Client{Timeout: time.Second}).Do(request)
+	if response != nil {
+		_ = response.Body.Close()
+	}
+	proxyConnection, proxyErr := net.DialTimeout("tcp", "127.0.0.1:"+proxyPort, time.Second)
+	if proxyConnection != nil {
+		_ = proxyConnection.Close()
+	}
+	cancel()
+	select {
+	case err := <-finished:
+		if err != nil {
+			t.Fatalf("adapter shutdown: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("adapter did not shut down")
+	}
+	if requestErr != nil || response == nil || response.StatusCode != http.StatusOK {
+		t.Fatalf("wildcard management request response=%v err=%v", response, requestErr)
+	}
+	if proxyErr != nil {
+		t.Fatalf("wildcard proxy connection: %v", proxyErr)
+	}
+	wantStartup := "kfadapter: ready management=http://0.0.0.0:" + managementPort + " proxy=socks5://0.0.0.0:" + proxyPort + "\n"
+	if startup.String() != wantStartup {
+		t.Fatalf("startup log = %q, want %q", startup.String(), wantStartup)
+	}
 }
 
 func TestAdapterLifecycleShutdown(t *testing.T) {
@@ -454,6 +537,27 @@ func TestNewAdapterUsesRelativeStateDirectory(t *testing.T) {
 	}
 	if err := subscription.ValidatePersistentState(persistent); err != nil {
 		t.Fatalf("bootstrapped SQLite state is invalid: %v", err)
+	}
+}
+
+func TestNewAdapterRejectsUnassignedListenBeforeCreatingState(t *testing.T) {
+	const unassigned = "192.0.2.1"
+	if err := validateListenInterface(unassigned); err == nil {
+		t.Skipf("documentation address %s is assigned on this host", unassigned)
+	}
+	directory := t.TempDir()
+	cfg := adapterTestConfig(t)
+	cfg.ListenAddr = unassigned
+	adapter, err := newAdapterAtStateDirectory(cfg, directory)
+	if err == nil {
+		closeAdapter(adapter)
+		t.Fatal("adapter started with an unassigned listen address")
+	}
+	if !strings.Contains(err.Error(), "not assigned") {
+		t.Fatalf("startup error = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(directory, "state.db")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("startup created state before NIC validation: %v", statErr)
 	}
 }
 
@@ -681,10 +785,18 @@ func adapterTestConfig(t *testing.T) config.Config {
 }
 
 func testAdapterConfig(managementListen, proxyListen string) config.Config {
+	management := netip.MustParseAddrPort(managementListen)
+	proxy := netip.MustParseAddrPort(proxyListen)
+	if management.Addr() != proxy.Addr() {
+		panic("test listeners must share an address")
+	}
 	return config.Config{
-		Management: config.Management{Listen: managementListen, SessionTTL: config.Duration(time.Minute)},
+		ListenAddr: management.Addr().String(),
+		Management: config.Management{
+			Port: config.Port(management.Port()), SessionTTL: config.Duration(time.Minute),
+		},
 		Proxy: config.Proxy{
-			Listen: proxyListen, DialTimeout: config.Duration(time.Second), HandshakeTimeout: config.Duration(time.Second),
+			Port: config.Port(proxy.Port()), DialTimeout: config.Duration(time.Second), HandshakeTimeout: config.Duration(time.Second),
 		},
 		Provider: config.Provider{RequestTimeout: config.Duration(time.Second), RefreshInterval: config.Duration(time.Hour)},
 	}

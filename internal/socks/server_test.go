@@ -932,49 +932,11 @@ func TestSOCKSBoundsInjectedDialContext(t *testing.T) {
 		_ = client.Close()
 	})
 }
-func TestSOCKSRefusesNonLoopbackListener(t *testing.T) {
-	fixture := newSOCKSFixture(t)
-	server := fixture.newServer(t)
-	if err := server.ListenAndServe(context.Background(), "192.0.2.1:0"); err == nil {
-		t.Fatal("specific non-loopback listener was accepted")
-	}
-}
-
-func TestSOCKSRefusesNoncanonicalListenerAddress(t *testing.T) {
-	fixture := newSOCKSFixture(t)
-	server := fixture.newServer(t)
-	for _, address := range []string{"localhost:0", "127.0.0.1:00", "[0:0:0:0:0:0:0:0]:0"} {
-		if err := server.ListenAndServe(context.Background(), address); err == nil {
-			t.Fatalf("noncanonical listener %q was accepted", address)
-		}
-	}
-}
-
-func TestSOCKSServeAllowsCanonicalWildcard(t *testing.T) {
-	fixture := newSOCKSFixture(t)
-	server := fixture.newServer(t)
-	listener, err := net.Listen("tcp", "0.0.0.0:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer listener.Close()
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- server.Serve(ctx, listener) }()
-	select {
-	case err := <-done:
-		t.Fatalf("Serve returned before cancellation: %v", err)
-	case <-time.After(25 * time.Millisecond):
-	}
-	cancel()
-	awaitServe(t, done)
-}
-
-func TestSOCKSServeRejectsSpecificNonLoopbackAddress(t *testing.T) {
+func TestSOCKSServeDoesNotImposeListenerAddressPolicy(t *testing.T) {
 	fixture := newSOCKSFixture(t)
 	listener := addressOnlyListener{address: &net.TCPAddr{IP: net.ParseIP("192.0.2.1"), Port: 10808}}
-	if err := fixture.newServer(t).Serve(context.Background(), listener); err == nil {
-		t.Fatal("Serve accepted a specific non-loopback listener")
+	if err := fixture.newServer(t).Serve(context.Background(), listener); !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("Serve error = %v, want listener Accept error", err)
 	}
 }
 

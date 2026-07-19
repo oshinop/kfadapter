@@ -3,9 +3,7 @@ name: kfadapter
 services:
   kfadapter:
     image: ghcr.io/oshinop/kfadapter:latest
-    ports:
-      - "127.0.0.1:10809:10809"
-      - "127.0.0.1:10808:10808"
+    network_mode: host
     user: "65532:65532"
     working_dir: /kfadapter
     init: true
@@ -16,7 +14,12 @@ services:
       TZ: "${KFADAPTER_TZ:-Asia/Shanghai}"
     volumes:
       - db_data:/kfadapter/data
-      - ./deploy/config.yml:/kfadapter/config.yml:ro
+      - type: bind
+        source: ./config.yaml
+        target: /kfadapter/config.yaml
+        read_only: true
+        bind:
+          create_host_path: false
     tmpfs:
       - /tmp:rw,noexec,nosuid,nodev,size=16m
     cap_drop:

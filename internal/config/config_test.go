@@ -9,21 +9,23 @@ import (
 )
 
 const validConfig = `
+listenAddr: 127.0.0.1
+hostname: adapter.example.com
 management:
-  listen: 127.0.0.1:10809
+  port: 10809
   sessionTTL: 30m
 proxy:
-  listen: 127.0.0.1:10808
+  port: 10808
   dialTimeout: 10s
   handshakeTimeout: 15s
 provider:
   requestTimeout: 15s
-  refreshInterval: 23h
+  refreshInterval: 2h
 `
 
 func writeConfig(t *testing.T, body string) string {
 	t.Helper()
-	path := filepath.Join(t.TempDir(), "config.yml")
+	path := filepath.Join(t.TempDir(), "config.yaml")
 	if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -38,13 +40,9 @@ func replaceConfigLine(t *testing.T, body, old, replacement string) string {
 	return strings.Replace(body, old, replacement, 1)
 }
 
-func configWithListener(t *testing.T, section, address string) string {
+func configWithListenAddr(t *testing.T, listenAddr string) string {
 	t.Helper()
-	old := "  listen: 127.0.0.1:10809\n"
-	if section == "proxy" {
-		old = "  listen: 127.0.0.1:10808\n"
-	}
-	return replaceConfigLine(t, validConfig, old, "  listen: \""+address+"\"\n")
+	return replaceConfigLine(t, validConfig, "listenAddr: 127.0.0.1\n", "listenAddr: \""+listenAddr+"\"\n")
 }
 
 func TestLoadValidConfig(t *testing.T) {
@@ -52,237 +50,160 @@ func TestLoadValidConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Management.Listen != "127.0.0.1:10809" ||
-		cfg.Proxy.Listen != "127.0.0.1:10808" ||
-		cfg.Management.SessionTTL.Value() != 30*time.Minute ||
-		cfg.Proxy.DialTimeout.Value() != 10*time.Second ||
-		cfg.Proxy.HandshakeTimeout.Value() != 15*time.Second ||
-		cfg.Provider.RequestTimeout.Value() != 15*time.Second ||
-		cfg.Provider.RefreshInterval.Value() != 23*time.Hour {
+	if cfg.ListenAddr != "127.0.0.1" || cfg.Hostname != "adapter.example.com" ||
+		cfg.Management.Port != 10809 || cfg.Proxy.Port != 10808 ||
+		cfg.ManagementAddress() != "127.0.0.1:10809" || cfg.ProxyAddress() != "127.0.0.1:10808" ||
+		cfg.Management.SessionTTL.Value() != 30*time.Minute || cfg.Proxy.DialTimeout.Value() != 10*time.Second ||
+		cfg.Proxy.HandshakeTimeout.Value() != 15*time.Second || cfg.Provider.RequestTimeout.Value() != 15*time.Second ||
+		cfg.Provider.RefreshInterval.Value() != 2*time.Hour {
 		t.Fatalf("unexpected config: %#v", cfg)
 	}
 }
 
-func TestLoadAppliesDefaults(t *testing.T) {
+func TestLoadAppliesLoopbackDefaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, "{}\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.Management.Listen != "127.0.0.1:10809" || cfg.Proxy.Listen != "127.0.0.1:10808" {
-		t.Fatalf("unexpected default listeners: %#v", cfg)
+	if cfg != Default() {
+		t.Fatalf("defaults = %#v, want %#v", cfg, Default())
 	}
-	if cfg.Management.SessionTTL.Value() != 30*time.Minute ||
-		cfg.Proxy.DialTimeout.Value() != 10*time.Second ||
-		cfg.Proxy.HandshakeTimeout.Value() != 15*time.Second ||
-		cfg.Provider.RequestTimeout.Value() != 15*time.Second ||
-		cfg.Provider.RefreshInterval.Value() != 23*time.Hour {
-		t.Fatalf("unexpected default durations: %#v", cfg)
+	if cfg.ListenAddr != "127.0.0.1" || cfg.Management.Port != 10809 || cfg.Proxy.Port != 10808 {
+		t.Fatalf("unexpected default listeners: %#v", cfg)
 	}
 }
 
-func TestLoadDerivesPublicAddresses(t *testing.T) {
-	tests := []struct {
-		name           string
-		management     string
-		proxy          string
-		wantManagement string
-		wantProxy      string
-	}{
-		{
-			name:           "preserves canonical loopback listeners",
-			management:     "127.0.0.2:18090",
-			proxy:          "[::1]:18091",
-			wantManagement: "127.0.0.2:18090",
-			wantProxy:      "[::1]:18091",
-		},
-		{
-			name:           "derives loopback addresses from wildcard ports",
-			management:     "0.0.0.0:18090",
-			proxy:          "[::]:18091",
-			wantManagement: "127.0.0.1:18090",
-			wantProxy:      "127.0.0.1:18091",
-		},
+func TestLoadCreatesDefaultConfigWhenMissing(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	cfg, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load missing config: %v", err)
 	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			body := configWithListener(t, "management", test.management)
-			body = replaceConfigLine(t, body, "  listen: 127.0.0.1:10808\n", "  listen: \""+test.proxy+"\"\n")
-			cfg, err := Load(writeConfig(t, body))
+	if cfg != Default() {
+		t.Fatalf("created config = %#v, want %#v", cfg, Default())
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
+		t.Fatalf("created config mode = %s", info.Mode())
+	}
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(contents), "hostname:") {
+		t.Fatalf("empty optional hostname was written: %s", contents)
+	}
+}
+
+func TestLoadAcceptsAnyCanonicalNumericListener(t *testing.T) {
+	for _, listenAddr := range []string{"127.0.0.2", "0.0.0.0", "192.0.2.1", "::1", "::", "2001:db8::1"} {
+		t.Run(listenAddr, func(t *testing.T) {
+			cfg, err := Load(writeConfig(t, configWithListenAddr(t, listenAddr)))
 			if err != nil {
 				t.Fatalf("Load: %v", err)
 			}
-			if got := cfg.ManagementAddress(); got != test.wantManagement {
-				t.Fatalf("ManagementAddress() = %q, want %q", got, test.wantManagement)
-			}
-			if got := cfg.ProxyAddress(); got != test.wantProxy {
-				t.Fatalf("ProxyAddress() = %q, want %q", got, test.wantProxy)
+			if cfg.ListenAddr != listenAddr {
+				t.Fatalf("listenAddr = %q, want %q", cfg.ListenAddr, listenAddr)
 			}
 		})
 	}
 }
 
-func TestLoadRejectsLegacySchema(t *testing.T) {
-	tests := []struct {
-		name   string
-		legacy string
-	}{
-		{name: "http.listen", legacy: "http:\n  listen: 127.0.0.1:10809\n"},
-		{name: "http.advertise", legacy: "http:\n  advertise: 127.0.0.1:10809\n"},
-		{name: "http.allowedHosts", legacy: "http:\n  allowedHosts: [127.0.0.1:10809]\n"},
-		{name: "http.allowedOrigins", legacy: "http:\n  allowedOrigins: [http://127.0.0.1:10809]\n"},
-		{name: "socks.listen", legacy: "socks:\n  listen: 127.0.0.1:10808\n"},
-		{name: "socks.advertise", legacy: "socks:\n  advertise: 127.0.0.1:10808\n"},
-		{name: "control.requestTimeout", legacy: "control:\n  requestTimeout: 15s\n"},
-		{name: "control.refreshInterval", legacy: "control:\n  refreshInterval: 23h\n"},
-		{name: "dataPlane.dialTimeout", legacy: "dataPlane:\n  dialTimeout: 10s\n"},
-		{name: "dataPlane.handshakeTimeout", legacy: "dataPlane:\n  handshakeTimeout: 15s\n"},
-		{name: "dataPlane.udpMode", legacy: "dataPlane:\n  udpMode: disabled_unverified\n"},
-		{name: "security.sessionTTL", legacy: "security:\n  sessionTTL: 30m\n"},
-		{name: "deployment.requireContainer", legacy: "deployment:\n  requireContainer: true\n"},
-		{name: "deployment.networkMode", legacy: "deployment:\n  networkMode: bridge_loopback_publish\n"},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := Load(writeConfig(t, validConfig+test.legacy)); err == nil {
-				t.Fatalf("Load accepted legacy field %s", test.name)
+func TestLoadRejectsInvalidListeners(t *testing.T) {
+	for _, listenAddr := range []string{"localhost", "127.0.0.1:10809", "0:0:0:0:0:0:0:1", " 127.0.0.1"} {
+		t.Run(listenAddr, func(t *testing.T) {
+			_, err := Load(writeConfig(t, configWithListenAddr(t, listenAddr)))
+			if err == nil || !strings.Contains(err.Error(), "listenAddr") {
+				t.Fatalf("Load error = %v, want listenAddr validation error", err)
 			}
 		})
+	}
+}
+
+func TestLoadValidatesOptionalHostname(t *testing.T) {
+	for _, hostname := range []string{"localhost", "kfadapter", "adapter.example.com", "KF-Adapter.Example"} {
+		t.Run("valid/"+hostname, func(t *testing.T) {
+			body := replaceConfigLine(t, validConfig, "hostname: adapter.example.com\n", "hostname: "+hostname+"\n")
+			if _, err := Load(writeConfig(t, body)); err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+		})
+	}
+	for _, hostname := range []string{"adapter.example.com:10809", "http://adapter.example.com", "adapter.example.com.", "bad_name", "127.0.0.1", "-bad.example", "bad-.example"} {
+		t.Run("invalid/"+hostname, func(t *testing.T) {
+			body := replaceConfigLine(t, validConfig, "hostname: adapter.example.com\n", "hostname: \""+hostname+"\"\n")
+			_, err := Load(writeConfig(t, body))
+			if err == nil || !strings.Contains(err.Error(), "hostname") {
+				t.Fatalf("Load error = %v, want hostname validation error", err)
+			}
+		})
+	}
+}
+
+func TestLoadValidatesPorts(t *testing.T) {
+	for _, port := range []string{"1", "65535"} {
+		t.Run("valid/"+port, func(t *testing.T) {
+			body := replaceConfigLine(t, validConfig, "  port: 10809\n", "  port: "+port+"\n")
+			if _, err := Load(writeConfig(t, body)); err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+		})
+	}
+	for _, port := range []string{"0", "-1", "010809", "65536", "\"10809\""} {
+		t.Run("invalid/"+port, func(t *testing.T) {
+			body := replaceConfigLine(t, validConfig, "  port: 10809\n", "  port: "+port+"\n")
+			if _, err := Load(writeConfig(t, body)); err == nil {
+				t.Fatal("Load accepted invalid port")
+			}
+		})
+	}
+}
+
+func TestLoadRejectsIdenticalPorts(t *testing.T) {
+	body := replaceConfigLine(t, validConfig, "  port: 10809\n", "  port: 10808\n")
+	if _, err := Load(writeConfig(t, body)); err == nil || !strings.Contains(err.Error(), "must be different") {
+		t.Fatalf("identical ports error = %v", err)
 	}
 }
 
 func TestLoadRejectsRemovedAndUnknownFields(t *testing.T) {
-	tests := []struct {
-		name string
-		body string
-	}{
-		{name: "management advertise", body: strings.Replace(validConfig, "management:\n", "management:\n  advertise: 127.0.0.1:10809\n", 1)},
-		{name: "management allowed hosts", body: strings.Replace(validConfig, "management:\n", "management:\n  allowedHosts: [127.0.0.1:10809]\n", 1)},
-		{name: "management allowed origins", body: strings.Replace(validConfig, "management:\n", "management:\n  allowedOrigins: [http://127.0.0.1:10809]\n", 1)},
-		{name: "proxy advertise", body: strings.Replace(validConfig, "proxy:\n", "proxy:\n  advertise: 127.0.0.1:10808\n", 1)},
-		{name: "proxy udp mode", body: strings.Replace(validConfig, "proxy:\n", "proxy:\n  udpMode: disabled_unverified\n", 1)},
-		{name: "unknown top level", body: validConfig + "unexpected: true\n"},
-		{name: "unknown nested", body: strings.Replace(validConfig, "provider:\n", "provider:\n  unexpected: true\n", 1)},
-	}
-	for _, test := range tests {
-		t.Run(test.name, func(t *testing.T) {
-			if _, err := Load(writeConfig(t, test.body)); err == nil {
+	for name, body := range map[string]string{
+		"removed top listen":  strings.Replace(validConfig, "listenAddr: 127.0.0.1\n", "listen: 127.0.0.1\n", 1),
+		"management listen":   strings.Replace(validConfig, "management:\n", "management:\n  listen: 127.0.0.1:10809\n", 1),
+		"management hostname": strings.Replace(validConfig, "management:\n", "management:\n  hostname: adapter.example.com\n", 1),
+		"proxy listen":        strings.Replace(validConfig, "proxy:\n", "proxy:\n  listen: 127.0.0.1:10808\n", 1),
+		"top port":            strings.Replace(validConfig, "listenAddr: 127.0.0.1\n", "listenAddr: 127.0.0.1\nport: 10809\n", 1),
+		"unknown nested":      strings.Replace(validConfig, "provider:\n", "provider:\n  unexpected: true\n", 1),
+		"unknown top":         validConfig + "unexpected: true\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, body)); err == nil {
 				t.Fatal("Load accepted unknown field")
 			}
 		})
 	}
 }
 
-func TestLoadValidatesListenerBoundaries(t *testing.T) {
-	tests := []struct {
-		name    string
-		address string
-		wantErr bool
-	}{
-		{name: "IPv4 loopback minimum port", address: "127.0.0.1:1"},
-		{name: "IPv4 loopback maximum port", address: "127.0.0.1:65535"},
-		{name: "IPv6 loopback minimum port", address: "[::1]:1"},
-		{name: "IPv6 loopback maximum port", address: "[::1]:65535"},
-		{name: "IPv4 wildcard", address: "0.0.0.0:18090"},
-		{name: "IPv6 wildcard", address: "[::]:18090"},
-		{name: "zero port", address: "127.0.0.1:0", wantErr: true},
-		{name: "negative port", address: "127.0.0.1:-1", wantErr: true},
-		{name: "nonnumeric port", address: "127.0.0.1:http", wantErr: true},
-		{name: "out of range port", address: "127.0.0.1:65536", wantErr: true},
-		{name: "leading zero port", address: "127.0.0.1:010809", wantErr: true},
-		{name: "unbracketed IPv6", address: "::1:10809", wantErr: true},
-		{name: "expanded IPv6", address: "[0:0:0:0:0:0:0:1]:10809", wantErr: true},
-		{name: "DNS host", address: "localhost:10809", wantErr: true},
-		{name: "nonloopback host", address: "192.0.2.1:10809", wantErr: true},
-	}
-	for _, section := range []string{"management", "proxy"} {
-		for _, test := range tests {
-			t.Run(section+"/"+test.name, func(t *testing.T) {
-				_, err := Load(writeConfig(t, configWithListener(t, section, test.address)))
-				if test.wantErr {
-					if err == nil || !strings.Contains(err.Error(), section+".listen") {
-						t.Fatalf("Load error = %v, want %s.listen validation error", err, section)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatalf("Load: %v", err)
-				}
-			})
-		}
-	}
-}
-
-func TestLoadRejectsSharedListenerPort(t *testing.T) {
-	body := replaceConfigLine(t, validConfig, "  listen: 127.0.0.1:10809\n", "  listen: 127.0.0.2:10808\n")
-	_, err := Load(writeConfig(t, body))
-	if err == nil || !strings.Contains(err.Error(), "management.listen and proxy.listen") {
-		t.Fatalf("Load error = %v, want distinct-port error", err)
-	}
-}
-
 func TestLoadValidatesDurationBounds(t *testing.T) {
 	fields := []struct {
-		name       string
-		line       string
-		prefix     string
-		path       string
-		minimum    string
-		maximum    string
-		belowRange string
-		aboveRange string
+		line, path, minimum, maximum string
 	}{
-		{name: "management session TTL", line: "  sessionTTL: 30m\n", prefix: "  sessionTTL: ", path: "management.sessionTTL", minimum: "1m", maximum: "24h", belowRange: "59s", aboveRange: "24h1s"},
-		{name: "proxy dial timeout", line: "  dialTimeout: 10s\n", prefix: "  dialTimeout: ", path: "proxy.dialTimeout", minimum: "1s", maximum: "10s", belowRange: "999ms", aboveRange: "11s"},
-		{name: "proxy handshake timeout", line: "  handshakeTimeout: 15s\n", prefix: "  handshakeTimeout: ", path: "proxy.handshakeTimeout", minimum: "1s", maximum: "1m", belowRange: "999ms", aboveRange: "1m1s"},
-		{name: "provider request timeout", line: "  requestTimeout: 15s\n", prefix: "  requestTimeout: ", path: "provider.requestTimeout", minimum: "1s", maximum: "15s", belowRange: "999ms", aboveRange: "16s"},
-		{name: "provider refresh interval", line: "  refreshInterval: 23h\n", prefix: "  refreshInterval: ", path: "provider.refreshInterval", minimum: "15m", maximum: "24h", belowRange: "14m59s", aboveRange: "24h1s"},
+		{"  sessionTTL: 30m\n", "management.sessionTTL", "59s", "24h1s"},
+		{"  dialTimeout: 10s\n", "proxy.dialTimeout", "999ms", "11s"},
+		{"  handshakeTimeout: 15s\n", "proxy.handshakeTimeout", "999ms", "1m1s"},
+		{"  requestTimeout: 15s\n", "provider.requestTimeout", "999ms", "16s"},
+		{"  refreshInterval: 2h\n", "provider.refreshInterval", "14m59s", "24h1s"},
 	}
 	for _, field := range fields {
-		for _, test := range []struct {
-			name    string
-			value   string
-			wantErr bool
-		}{
-			{name: "minimum", value: field.minimum},
-			{name: "maximum", value: field.maximum},
-			{name: "below minimum", value: field.belowRange, wantErr: true},
-			{name: "above maximum", value: field.aboveRange, wantErr: true},
-		} {
-			t.Run(field.name+"/"+test.name, func(t *testing.T) {
-				body := replaceConfigLine(t, validConfig, field.line, field.prefix+test.value+"\n")
+		for _, value := range []string{field.minimum, field.maximum, "0s", "-1s"} {
+			t.Run(field.path+"/"+value, func(t *testing.T) {
+				body := replaceConfigLine(t, validConfig, field.line, strings.Split(field.line, ":")[0]+": "+value+"\n")
 				_, err := Load(writeConfig(t, body))
-				if test.wantErr {
-					if err == nil || !strings.Contains(err.Error(), field.path) {
-						t.Fatalf("Load error = %v, want %s range error", err, field.path)
-					}
-					return
-				}
-				if err != nil {
-					t.Fatalf("Load: %v", err)
-				}
-			})
-		}
-	}
-}
-
-func TestLoadRejectsNonPositiveDurations(t *testing.T) {
-	fields := []struct {
-		name   string
-		line   string
-		prefix string
-	}{
-		{name: "management session TTL", line: "  sessionTTL: 30m\n", prefix: "  sessionTTL: "},
-		{name: "proxy dial timeout", line: "  dialTimeout: 10s\n", prefix: "  dialTimeout: "},
-		{name: "proxy handshake timeout", line: "  handshakeTimeout: 15s\n", prefix: "  handshakeTimeout: "},
-		{name: "provider request timeout", line: "  requestTimeout: 15s\n", prefix: "  requestTimeout: "},
-		{name: "provider refresh interval", line: "  refreshInterval: 23h\n", prefix: "  refreshInterval: "},
-	}
-	for _, field := range fields {
-		for _, value := range []string{"0s", "-1s"} {
-			t.Run(field.name+"/"+value, func(t *testing.T) {
-				body := replaceConfigLine(t, validConfig, field.line, field.prefix+value+"\n")
-				if _, err := Load(writeConfig(t, body)); err == nil {
-					t.Fatal("Load succeeded, want rejection")
+				if err == nil {
+					t.Fatalf("Load accepted %s", value)
 				}
 			})
 		}

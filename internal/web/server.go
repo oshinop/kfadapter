@@ -18,7 +18,7 @@ func NewHTTPServer(config Config, dependencies Dependencies) (*http.Server, *API
 		return nil, nil, err
 	}
 	return &http.Server{
-		Addr:              api.config.ListenAddress,
+		Addr:              api.config.Listen,
 		Handler:           api,
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       api.config.ReadTimeout,
@@ -28,13 +28,13 @@ func NewHTTPServer(config Config, dependencies Dependencies) (*http.Server, *API
 	}, api, nil
 }
 
-// Listen binds the API's validated numeric loopback or wildcard address. Cmd
-// owns serving and shutdown orchestration.
+// Listen binds the configured management address. Cmd owns serving and
+// shutdown orchestration.
 func (a *API) Listen() (net.Listener, error) {
 	if a == nil {
 		return nil, net.ErrClosed
 	}
-	listener, err := net.Listen("tcp", a.config.ListenAddress)
+	listener, err := net.Listen("tcp", a.config.Listen)
 	if err != nil {
 		return nil, err
 	}

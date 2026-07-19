@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"net/netip"
 	"strconv"
 	"strings"
 	"sync"
@@ -66,8 +65,7 @@ type Server struct {
 	drained      chan struct{}
 }
 
-// New constructs a server. It does not open a listener; Serve admits only
-// canonical numeric loopback or wildcard container addresses.
+// New constructs a server. Listener selection belongs to the caller.
 func New(config Config) (*Server, error) {
 	if config.Snapshots == nil {
 		return nil, errors.New("socks: snapshot source is required")
@@ -205,30 +203,11 @@ func (s *Server) forceActiveHandlers() {
 	}
 }
 
-// ListenAndServe opens and serves only a canonical numeric IPv4 or IPv6
-// loopback or wildcard address. Canceling ctx stops accepts; callers then use
-// Shutdown to drain handlers.
-func (s *Server) ListenAndServe(ctx context.Context, address string) error {
-	if !isPermittedListenAddress(address) {
-		return fmt.Errorf("socks: refusing listener %q", address)
-	}
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		return err
-	}
-	defer listener.Close()
-	return s.Serve(ctx, listener)
-}
-
-// Serve accepts connections from a pre-opened canonical loopback or wildcard
-// listener. Canceling ctx stops accepts only; accepted handlers retain
+// Serve accepts connections until ctx is canceled. Accepted handlers retain
 // independent contexts and must be drained with Shutdown.
 func (s *Server) Serve(ctx context.Context, listener net.Listener) error {
 	if s == nil || ctx == nil || listener == nil {
 		return errors.New("socks: server, context, and listener are required")
-	}
-	if !isCanonicalLoopbackAddr(listener.Addr()) && !isCanonicalWildcardAddr(listener.Addr()) {
-		return fmt.Errorf("socks: refusing listener %q", listener.Addr())
 	}
 	if err := s.beginServe(listener); err != nil {
 		return err
@@ -280,9 +259,6 @@ func (s *Server) HandleConn(ctx context.Context, client net.Conn) error {
 		return errors.New("socks: server and client are required")
 	}
 	defer client.Close()
-	if !isLoopbackAddr(client.RemoteAddr()) {
-		return errors.New("socks: refusing non-loopback client")
-	}
 	handlerDone := make(chan struct{})
 	go func() {
 		select {
@@ -563,40 +539,4 @@ func dialReply(err error) byte {
 		return replyConnectionRefused
 	}
 	return replyGeneralFailure
-}
-
-func isPermittedListenAddress(address string) bool {
-	host, port, err := net.SplitHostPort(address)
-	if err != nil || host == "" || port == "" {
-		return false
-	}
-	parsedPort, err := strconv.ParseUint(port, 10, 16)
-	if err != nil || strconv.FormatUint(parsedPort, 10) != port {
-		return false
-	}
-	parsed, err := netip.ParseAddr(host)
-	return err == nil && parsed.String() == host && (parsed.IsLoopback() || parsed.IsUnspecified())
-}
-
-func isCanonicalLoopbackAddr(address net.Addr) bool {
-	tcp, ok := address.(*net.TCPAddr)
-	if !ok || tcp == nil || tcp.Port < 1 || tcp.Port > 65535 {
-		return false
-	}
-	parsed, ok := netip.AddrFromSlice(tcp.IP)
-	return ok && parsed.IsLoopback()
-}
-
-func isLoopbackAddr(address net.Addr) bool {
-	tcp, ok := address.(*net.TCPAddr)
-	return ok && tcp != nil && tcp.IP.IsLoopback()
-}
-
-func isCanonicalWildcardAddr(address net.Addr) bool {
-	tcp, ok := address.(*net.TCPAddr)
-	if !ok || tcp == nil || tcp.Port < 1 || tcp.Port > 65535 {
-		return false
-	}
-	parsed, ok := netip.AddrFromSlice(tcp.IP)
-	return ok && parsed.IsUnspecified() && (parsed.String() == "0.0.0.0" || parsed.String() == "::")
 }

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
@@ -101,27 +102,78 @@ func (s *Service) loadPersisted() (state.PersistentState, error) {
 }
 
 // NewService validates and primes serving material before it accepts requests.
-// A valid body rendered for a prior numeric-loopback listener is migrated by
-// exact re-rendering; tampered bodies remain fail-closed.
+// A valid body rendered for a prior configured listener is migrated by exact
+// re-rendering; tampered bodies remain fail-closed.
 func NewService(config ServiceConfig) (*Service, error) {
 	if config.Store == nil {
 		return nil, errors.New("subscription state store is required")
 	}
-	if err := validateLoopbackAddress(config.SocksAddress); err != nil {
+	if err := validateAddress(config.SocksAddress); err != nil {
 		return nil, err
 	}
 	if config.Now == nil {
 		config.Now = time.Now
 	}
 	service := &Service{
-		store: config.Store, snapshots: config.Snapshots, socksAddress: config.SocksAddress,
-		now: config.Now, mutationLocker: config.MutationLocker,
+		store: config.Store, snapshots: config.Snapshots,
+		socksAddress: config.SocksAddress, now: config.Now, mutationLocker: config.MutationLocker,
 		responseSlots: make(chan struct{}, subscriptionResponseConcurrency),
 	}
 	if err := service.reconcileAndPrime(); err != nil {
 		return nil, err
 	}
 	return service, nil
+}
+
+// SetSocksAddress re-renders the active subscription when a wildcard listener
+// is reached through a concrete host address.
+func (s *Service) SetSocksAddress(address string) error {
+	if s == nil {
+		return ErrSubscriptionUnavailable
+	}
+	if err := validateAddress(address); err != nil {
+		return err
+	}
+	if s.mutationLocker != nil {
+		s.mutationLocker.Lock()
+		defer s.mutationLocker.Unlock()
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.socksAddress == address {
+		return nil
+	}
+	previous := s.socksAddress
+	s.socksAddress = address
+	persistent, err := s.loadPersisted()
+	if err != nil {
+		s.socksAddress = previous
+		return err
+	}
+	updated, changed, err := s.reconcileListenerAddress(persistent)
+	if err != nil {
+		s.socksAddress = previous
+		return err
+	}
+	if changed {
+		updated, err = s.store.Update(func(candidate *state.PersistentState) error {
+			repaired, changed, err := s.reconcileListenerAddress(*candidate)
+			if err != nil || !changed {
+				return err
+			}
+			*candidate = repaired
+			return nil
+		})
+		if err != nil {
+			s.socksAddress = previous
+			return err
+		}
+	}
+	if err := s.validateRenderedState(updated); err != nil {
+		return err
+	}
+	s.primeCacheLocked(updated)
+	return nil
 }
 
 func (s *Service) reconcileAndPrime() error {
@@ -134,6 +186,9 @@ func (s *Service) reconcileAndPrime() error {
 	persistent, err := s.loadPersisted()
 	if err != nil {
 		return err
+	}
+	if address, ok := concreteRenderedAddress(s.socksAddress, persistent.LastGood.RenderedSubscription); ok {
+		s.socksAddress = address
 	}
 	updated, changed, err := s.reconcileListenerAddress(persistent)
 	if err != nil {
@@ -159,6 +214,30 @@ func (s *Service) reconcileAndPrime() error {
 	return nil
 }
 
+func concreteRenderedAddress(listenAddress, body string) (string, bool) {
+	listenHost, listenPort, err := parseAddress(listenAddress)
+	if err != nil {
+		return "", false
+	}
+	listenIP, _ := netip.ParseAddr(listenHost)
+	if !listenIP.IsUnspecified() {
+		return "", false
+	}
+	address, ok := renderedAddress(body)
+	if !ok {
+		return "", false
+	}
+	host, port, err := parseAddress(address)
+	if err != nil || port != listenPort {
+		return "", false
+	}
+	ip, err := netip.ParseAddr(host)
+	if err != nil {
+		return address, true
+	}
+	return address, !ip.IsUnspecified() && ip.Is4() == listenIP.Is4()
+}
+
 func (s *Service) reconcileListenerAddress(persistent state.PersistentState) (state.PersistentState, bool, error) {
 	candidate := persistent.Clone()
 	lastGood := candidate.LastGood
@@ -178,7 +257,7 @@ func (s *Service) reconcileListenerAddress(persistent state.PersistentState) (st
 	if rendered == lastGood.RenderedSubscription {
 		return candidate, false, nil
 	}
-	if !s.matchesRenderedAtLoopback(lastGood.RenderedSubscription, lastGood.Nodes, candidate.Subscription) {
+	if !s.matchesRenderedAtAddress(lastGood.RenderedSubscription, lastGood.Nodes, candidate.Subscription) {
 		return state.PersistentState{}, false, errRenderedSubscriptionMismatch
 	}
 	candidate.LastGood.RenderedSubscription = rendered
@@ -188,11 +267,11 @@ func (s *Service) reconcileListenerAddress(persistent state.PersistentState) (st
 	return candidate, true, nil
 }
 
-// matchesRenderedAtLoopback accepts the current renderer and a pre-cutover
-// body filtered by persisted legacy exclusions, so startup can safely rewrite
-// the latter with every currently eligible node.
-func (s *Service) matchesRenderedAtLoopback(body string, nodes []state.PersistedNode, generation state.SubscriptionGeneration) bool {
-	address, ok := renderedLoopbackAddress(body)
+// matchesRenderedAtAddress accepts the current renderer and a pre-cutover body
+// filtered by persisted legacy exclusions, so startup can safely rewrite the
+// latter with every currently eligible node.
+func (s *Service) matchesRenderedAtAddress(body string, nodes []state.PersistedNode, generation state.SubscriptionGeneration) bool {
+	address, ok := renderedAddress(body)
 	if !ok {
 		return false
 	}
@@ -204,7 +283,7 @@ func (s *Service) matchesRenderedAtLoopback(body string, nodes []state.Persisted
 	return err == nil && legacy == body
 }
 
-func renderedLoopbackAddress(body string) (string, bool) {
+func renderedAddress(body string) (string, bool) {
 	decoded, err := base64.StdEncoding.DecodeString(body)
 	if err != nil || len(decoded) == 0 {
 		return "", false
@@ -220,7 +299,7 @@ func renderedLoopbackAddress(body string) (string, bool) {
 			return "", false
 		}
 		if address == "" {
-			if validateLoopbackAddress(link.Host) != nil {
+			if validateAddress(link.Host) != nil {
 				return "", false
 			}
 			address = link.Host
@@ -499,7 +578,7 @@ func (s *Service) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeNotFound(w)
 		return
 	}
-	s.serveSubscription(w, r, binding)
+	s.serveSubscription(w, r, binding, "")
 }
 
 // ServeSubscription serves one router-extracted account-binding path segment.
@@ -510,7 +589,17 @@ func (s *Service) ServeSubscription(w http.ResponseWriter, r *http.Request, bind
 		return
 	}
 	defer s.releaseResponseSlot()
-	s.serveSubscription(w, r, binding)
+	s.serveSubscription(w, r, binding, "")
+}
+
+// ServeSubscriptionAt serves a valid binding after adapting a wildcard SOCKS
+// listener to the concrete host used for this request.
+func (s *Service) ServeSubscriptionAt(w http.ResponseWriter, r *http.Request, binding, socksAddress string) {
+	if !s.acquireResponseSlot(w) {
+		return
+	}
+	defer s.releaseResponseSlot()
+	s.serveSubscription(w, r, binding, socksAddress)
 }
 
 func (s *Service) acquireResponseSlot(w http.ResponseWriter) bool {
@@ -533,7 +622,17 @@ func writeResponseBusy(w http.ResponseWriter) {
 	w.WriteHeader(http.StatusServiceUnavailable)
 }
 
-func (s *Service) serveSubscription(w http.ResponseWriter, r *http.Request, binding string) {
+func writeResponseUnavailable(w http.ResponseWriter, retry bool) {
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("Content-Length", "0")
+	w.Header().Set("Cache-Control", "no-store")
+	if retry {
+		w.Header().Set("Retry-After", "1")
+	}
+	w.WriteHeader(http.StatusServiceUnavailable)
+}
+
+func (s *Service) serveSubscription(w http.ResponseWriter, r *http.Request, binding, socksAddress string) {
 	if r.Method != http.MethodGet || !validBinding(binding) {
 		writeNotFound(w)
 		return
@@ -547,6 +646,20 @@ func (s *Service) serveSubscription(w http.ResponseWriter, r *http.Request, bind
 	if !matched {
 		writeNotFound(w)
 		return
+	}
+	if socksAddress != "" {
+		if err := s.SetSocksAddress(socksAddress); err != nil {
+			writeResponseUnavailable(w, true)
+			return
+		}
+		s.mu.Lock()
+		current = s.cache
+		matched = current.body != "" && subtle.ConstantTimeCompare(token[:], current.binding[:]) == 1
+		s.mu.Unlock()
+		if !matched {
+			writeNotFound(w)
+			return
+		}
 	}
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
@@ -733,7 +846,7 @@ func renderedSubscriptionAddress(rendered string) (string, error) {
 	if err != nil || parsed.Scheme != "socks5" || parsed.User == nil || parsed.Host == "" || parsed.RawQuery != "" {
 		return "", errRenderedSubscriptionMismatch
 	}
-	if err := validateLoopbackAddress(parsed.Host); err != nil {
+	if err := validateAddress(parsed.Host); err != nil {
 		return "", errRenderedSubscriptionMismatch
 	}
 	return parsed.Host, nil

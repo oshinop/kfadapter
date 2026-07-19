@@ -30,7 +30,10 @@ func (a subscriptionAdapter) Metadata(context.Context) (SubscriptionMetadata, er
 	}, nil
 }
 
-func (a subscriptionAdapter) SubscriptionURL(_ context.Context, baseURL string) (SubscriptionURL, error) {
+func (a subscriptionAdapter) SubscriptionURL(_ context.Context, baseURL, socksAddress string) (SubscriptionURL, error) {
+	if err := a.service.SetSocksAddress(socksAddress); err != nil {
+		return SubscriptionURL{}, err
+	}
 	url, generation, err := a.service.SubscriptionURL(baseURL)
 	if err != nil {
 		return SubscriptionURL{}, err
@@ -38,6 +41,6 @@ func (a subscriptionAdapter) SubscriptionURL(_ context.Context, baseURL string) 
 	return SubscriptionURL{URL: url, Generation: generation}, nil
 }
 
-func (a subscriptionAdapter) ServeSubscription(w http.ResponseWriter, r *http.Request, binding string) {
-	a.service.ServeSubscription(w, r, binding)
+func (a subscriptionAdapter) ServeSubscription(w http.ResponseWriter, r *http.Request, binding, socksAddress string) {
+	a.service.ServeSubscriptionAt(w, r, binding, socksAddress)
 }
