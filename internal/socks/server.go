@@ -315,11 +315,11 @@ func (s *Server) HandleConn(ctx context.Context, client net.Conn) error {
 		_ = writeReply(client, code, target{})
 		return err
 	}
-	if command != commandConnect {
+	if command != commandConnect && command != commandUDP {
 		_ = writeReply(client, replyCommandUnsupported, target{})
 		return nil
 	}
-	if destination.Port == 0 {
+	if command == commandConnect && destination.Port == 0 {
 		_ = writeReply(client, replyGeneralFailure, target{})
 		return errBadAddress
 	}
@@ -358,6 +358,20 @@ func (s *Server) HandleConn(ctx context.Context, client net.Conn) error {
 		return errors.New("socks: unsupported WIFIIN tunnel cipher")
 	}
 
+	var association *udpAssociation
+	if command == commandUDP {
+		association, err = newUDPAssociation(client, destination)
+		if err != nil {
+			code := replyGeneralFailure
+			if errors.Is(err, errAddressTypeUnsupported) {
+				code = replyAddressUnsupported
+			}
+			_ = writeReply(client, code, target{})
+			return err
+		}
+		defer association.conn.Close()
+	}
+
 	dialCtx, cancelDial := context.WithTimeout(ctx, s.handshakeTimeout)
 	upstream, err := s.dial(dialCtx, "tcp", net.JoinHostPort(node.Host, strconv.Itoa(int(node.Port))))
 	cancelDial()
@@ -376,7 +390,12 @@ func (s *Server) HandleConn(ctx context.Context, client net.Conn) error {
 		return fmt.Errorf("socks: set handshake deadline: %w", err)
 	}
 	key := wifiin.DeriveKey(pin.Session.TunnelPassword)
-	header, err := wifiin.NewOutboundHeader(key[:], destination.Host, destination.Port, pin.Session.ProviderExtension)
+	var header *wifiin.OutboundHeader
+	if command == commandUDP {
+		header, err = wifiin.NewUOTOutboundHeader(key[:], node.Host, node.Port, pin.Session.ProviderExtension)
+	} else {
+		header, err = wifiin.NewOutboundHeader(key[:], destination.Host, destination.Port, pin.Session.ProviderExtension)
+	}
 	if err == nil {
 		err = writeAll(upstream, header.Packet)
 	}
@@ -421,6 +440,12 @@ func (s *Server) HandleConn(ctx context.Context, client net.Conn) error {
 		return state.ErrSelectorUnknown
 	}
 	pin = finalPin
+	if association != nil {
+		if err := writeReply(client, replySucceeded, targetFromAddr(association.conn.LocalAddr())); err != nil {
+			return err
+		}
+		return s.relayUDPAssociation(ctx, client, upstream, reader, header, key[:], association)
+	}
 	if err := writeReply(client, replySucceeded, targetFromAddr(upstream.LocalAddr())); err != nil {
 		return err
 	}
@@ -511,11 +536,17 @@ func sameCanonicalNode(left, right state.Node) bool {
 }
 
 func targetFromAddr(address net.Addr) target {
-	tcp, ok := address.(*net.TCPAddr)
-	if !ok || tcp == nil || tcp.Port < 1 || tcp.Port > 65535 {
-		return target{}
+	switch value := address.(type) {
+	case *net.TCPAddr:
+		if value != nil && value.Port > 0 && value.Port <= 65535 {
+			return target{Host: value.IP.String(), Port: uint16(value.Port)}
+		}
+	case *net.UDPAddr:
+		if value != nil && value.Port > 0 && value.Port <= 65535 {
+			return target{Host: value.IP.String(), Port: uint16(value.Port)}
+		}
 	}
-	return target{Host: tcp.IP.String(), Port: uint16(tcp.Port)}
+	return target{}
 }
 
 func dialReply(err error) byte {

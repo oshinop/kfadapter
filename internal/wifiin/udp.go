@@ -7,141 +7,171 @@ import (
 	"io"
 )
 
-// ErrUDPUnavailable is returned by production call paths. Candidate codecs in
-// this file are deliberately named TestOnly and must not enable UDP relay.
-var ErrUDPUnavailable = errors.New("wifiin: UDP is unavailable pending a live fixture")
-
-var (
-	errInvalidUDPDatagram = errors.New("wifiin: invalid candidate SOCKS UDP datagram")
-	errFragmentedUDP      = errors.New("wifiin: fragmented SOCKS UDP datagram")
+const (
+	maxUOTBodySize     = 1<<16 - 1
+	initialUOTBuffer   = 2048
+	uotFlowIDSize      = 2
+	socksUDPHeaderSize = 3
 )
 
-// EncodeCandidateUDPTestOnly implements the unverified legacy-SS candidate
-// mapping for deterministic protocol tests. It must not be used by a running
-// SOCKS server. random must provide a fresh 16-byte IV per datagram.
-func EncodeCandidateUDPTestOnly(key []byte, socksDatagram []byte, random io.Reader) ([]byte, error) {
-	inner, err := candidateUDPInner(socksDatagram)
-	if err != nil {
-		return nil, err
-	}
-	iv := make([]byte, IVSize)
-	if _, err := io.ReadFull(random, iv); err != nil {
-		return nil, fmt.Errorf("wifiin: read candidate UDP IV: %w", err)
-	}
-	stream, err := NewEncrypter(key, iv)
-	if err != nil {
-		return nil, err
-	}
-	out := make([]byte, IVSize+len(inner))
-	copy(out, iv)
-	stream.XORKeyStream(out[IVSize:], inner)
-	return out, nil
+var (
+	ErrInvalidUDPDatagram    = errors.New("wifiin: invalid SOCKS UDP datagram")
+	ErrFragmentedUDP         = errors.New("wifiin: fragmented SOCKS UDP datagram")
+	ErrUnsupportedUDPAddress = errors.New("wifiin: unsupported UDP address type")
+	ErrInvalidUOTFrame       = errors.New("wifiin: invalid UDP-over-TCP frame")
+)
+
+// UOTWriter serializes SOCKS UDP datagrams into the verified WIFIIN
+// UDP-over-TCP stream format. The supplied writer must be the continuous
+// client-to-server AES-CFB stream established by a type-0x23 handshake.
+// UOTWriter is not safe for concurrent use.
+type UOTWriter struct {
+	w     io.Writer
+	frame []byte
 }
 
-// DecodeCandidateUDPTestOnly decodes the unverified legacy-SS candidate
-// response into the SOCKS UDP datagram format. It is test-only and does not
-// validate any WIFIIN provider authentication.
-func DecodeCandidateUDPTestOnly(key []byte, encrypted []byte) ([]byte, error) {
-	if len(encrypted) <= IVSize {
-		return nil, errInvalidUDPDatagram
+func NewUOTWriter(w io.Writer) (*UOTWriter, error) {
+	if w == nil {
+		return nil, errors.New("wifiin: UOT writer is required")
 	}
-	stream, err := NewDecrypter(key, encrypted[:IVSize])
+	return &UOTWriter{w: w, frame: make([]byte, initialUOTBuffer)}, nil
+}
+
+// WriteSOCKSDatagram writes one RFC 1928 UDP datagram. flowID identifies the
+// client's UDP flow and is echoed by the WIFIIN server in response frames.
+func (w *UOTWriter) WriteSOCKSDatagram(flowID uint16, datagram []byte) error {
+	if len(datagram) < socksUDPHeaderSize || datagram[0] != 0 || datagram[1] != 0 {
+		return ErrInvalidUDPDatagram
+	}
+	if datagram[2] != 0 {
+		return ErrFragmentedUDP
+	}
+	addressLength, err := uotAddressLength(datagram[socksUDPHeaderSize:], false)
 	if err != nil {
-		return nil, err
+		return ErrInvalidUDPDatagram
 	}
-	inner := make([]byte, len(encrypted)-IVSize)
-	stream.XORKeyStream(inner, encrypted[IVSize:])
-	if _, err := candidateAddressLength(inner); err != nil {
-		return nil, err
+	inner := datagram[socksUDPHeaderSize:]
+	// The production client emits only type-1 destinations. Live WIFIIN nodes
+	// close the UOT stream when sent domain or IPv6 destination frames.
+	if inner[0] != 0x01 {
+		return ErrUnsupportedUDPAddress
 	}
-	out := make([]byte, 3+len(inner))
-	copy(out[3:], inner)
-	return out, nil
+	bodyLength := len(inner) + uotFlowIDSize
+	if bodyLength > maxUOTBodySize {
+		return fmt.Errorf("%w: frame body is too large", ErrInvalidUDPDatagram)
+	}
+	frameLength := 2 + bodyLength
+	if cap(w.frame) < frameLength {
+		w.frame = make([]byte, frameLength)
+	} else {
+		w.frame = w.frame[:frameLength]
+	}
+	binary.BigEndian.PutUint16(w.frame[:2], uint16(bodyLength))
+	copy(w.frame[2:2+addressLength], inner[:addressLength])
+	flowOffset := 2 + addressLength
+	binary.BigEndian.PutUint16(w.frame[flowOffset:flowOffset+uotFlowIDSize], flowID)
+	copy(w.frame[flowOffset+uotFlowIDSize:], inner[addressLength:])
+	if err := writeFull(w.w, w.frame); err != nil {
+		return fmt.Errorf("wifiin: write UOT frame: %w", err)
+	}
+	return nil
 }
 
-func candidateUDPInner(d []byte) ([]byte, error) {
-	if len(d) < 4 || d[0] != 0 || d[1] != 0 {
-		return nil, errInvalidUDPDatagram
-	}
-	if d[2] != 0 {
-		return nil, errFragmentedUDP
-	}
-	inner := d[3:]
-	if _, err := candidateAddressLength(inner); err != nil {
-		return nil, err
-	}
-	return inner, nil
+// UOTReader deserializes a continuous decrypted WIFIIN UDP-over-TCP stream.
+// It handles arbitrary TCP fragmentation and coalescing. UOTReader is not safe
+// for concurrent use.
+type UOTReader struct {
+	r    io.Reader
+	body []byte
 }
 
-func candidateAddressLength(inner []byte) (int, error) {
-	if len(inner) < 1 {
-		return 0, errInvalidUDPDatagram
+func NewUOTReader(r io.Reader) (*UOTReader, error) {
+	if r == nil {
+		return nil, errors.New("wifiin: UOT reader is required")
 	}
-	var addressLength int
-	switch inner[0] {
-	case 0x01:
-		addressLength = 1 + 4 + 2
-	case 0x04:
-		addressLength = 1 + 16 + 2
-	case 0x03:
-		if len(inner) < 2 {
-			return 0, errInvalidUDPDatagram
+	return &UOTReader{r: r, body: make([]byte, initialUOTBuffer)}, nil
+}
+
+// ReadSOCKSDatagram reads one UOT response into dst and restores the RFC 1928
+// three-byte UDP prefix. It returns the response flow ID separately.
+func (r *UOTReader) ReadSOCKSDatagram(dst []byte) (n int, flowID uint16, err error) {
+	var prefix [2]byte
+	for {
+		if _, err := io.ReadFull(r.r, prefix[:]); err != nil {
+			return 0, 0, fmt.Errorf("wifiin: read UOT frame length: %w", err)
 		}
-		addressLength = 1 + 1 + int(inner[1]) + 2
+		bodyLength := int(binary.BigEndian.Uint16(prefix[:]))
+		if bodyLength == 0 {
+			// The official client accepts zero-length keepalives between frames.
+			continue
+		}
+		if cap(r.body) < bodyLength {
+			r.body = make([]byte, bodyLength)
+		} else {
+			r.body = r.body[:bodyLength]
+		}
+		if _, err := io.ReadFull(r.r, r.body); err != nil {
+			return 0, 0, fmt.Errorf("wifiin: read UOT frame body: %w", err)
+		}
+		addressLength, err := uotAddressLength(r.body, true)
+		if err != nil || addressLength+uotFlowIDSize > bodyLength {
+			return 0, 0, ErrInvalidUOTFrame
+		}
+		outputLength := socksUDPHeaderSize + bodyLength - uotFlowIDSize
+		if len(dst) < outputLength {
+			return 0, 0, io.ErrShortBuffer
+		}
+		dst[0], dst[1], dst[2] = 0, 0, 0
+		copy(dst[socksUDPHeaderSize:socksUDPHeaderSize+addressLength], r.body[:addressLength])
+		// The reference decoder selects the address type from the low nibble.
+		dst[socksUDPHeaderSize] &= 0x0f
+		flowOffset := addressLength
+		flowID = binary.BigEndian.Uint16(r.body[flowOffset : flowOffset+uotFlowIDSize])
+		copy(dst[socksUDPHeaderSize+addressLength:outputLength], r.body[flowOffset+uotFlowIDSize:])
+		return outputLength, flowID, nil
+	}
+}
+
+func uotAddressLength(packet []byte, maskType bool) (int, error) {
+	if len(packet) < 1 {
+		return 0, ErrInvalidUOTFrame
+	}
+	addressType := packet[0]
+	if maskType {
+		addressType &= 0x0f
+	}
+	var length int
+	switch addressType {
+	case 0x01:
+		length = 1 + 4 + 2
+	case 0x04:
+		length = 1 + 16 + 2
+	case 0x03:
+		if len(packet) < 2 || packet[1] == 0 {
+			return 0, ErrInvalidUOTFrame
+		}
+		length = 1 + 1 + int(packet[1]) + 2
 	default:
-		return 0, errInvalidUDPDatagram
+		return 0, ErrInvalidUOTFrame
 	}
-	if len(inner) < addressLength {
-		return 0, errInvalidUDPDatagram
+	if len(packet) < length {
+		return 0, ErrInvalidUOTFrame
 	}
-	return addressLength, nil
+	return length, nil
 }
 
-// LegacyInitialOTATestOnly encodes the unverified one-time-authentication
-// payload described in the reverse-engineering notes. The returned bytes are
-// encrypted with a new CFB context seeded by iv. It is never selected at
-// runtime.
-func LegacyInitialOTATestOnly(masterKey, iv, plaintext []byte) ([]byte, error) {
-	if len(plaintext) == 0 {
-		return nil, errors.New("wifiin: OTA plaintext is empty")
+func writeFull(w io.Writer, payload []byte) error {
+	for len(payload) != 0 {
+		n, err := w.Write(payload)
+		if n > 0 {
+			payload = payload[n:]
+		}
+		if err != nil {
+			return err
+		}
+		if n == 0 {
+			return io.ErrNoProgress
+		}
 	}
-	plain := make([]byte, len(plaintext), len(plaintext)+10)
-	copy(plain, plaintext)
-	plain[0] |= 0x10
-	tag := hmacSHA1(append(copyBytes(iv), masterKey...), plain)
-	plain = append(plain, tag[:10]...)
-	stream, err := NewEncrypter(masterKey, iv)
-	if err != nil {
-		return nil, err
-	}
-	stream.XORKeyStream(plain, plain)
-	return plain, nil
-}
-
-// LegacyChunkOTATestOnly returns an unencrypted candidate authenticated TCP
-// chunk. A caller testing it may pass the result through the continuous CFB
-// stream for that connection. sequence is not incremented here so tests can
-// assert the exact wire input deterministically.
-func LegacyChunkOTATestOnly(initialOutboundIV []byte, sequence uint32, payload []byte) ([]byte, error) {
-	if len(payload) > 0xffff {
-		return nil, errors.New("wifiin: OTA payload exceeds uint16 length")
-	}
-	key := make([]byte, len(initialOutboundIV)+4)
-	copy(key, initialOutboundIV)
-	binary.BigEndian.PutUint32(key[len(initialOutboundIV):], sequence)
-	tag := hmacSHA1(key, payload)
-	out := make([]byte, 2+10+len(payload))
-	binary.BigEndian.PutUint16(out[:2], uint16(len(payload)))
-	copy(out[2:12], tag[:10])
-	copy(out[12:], payload)
-	return out, nil
-}
-
-func hmacSHA1(key, input []byte) [20]byte {
-	// Kept here rather than enabling any auth mode in the active TCP path.
-	h := newHMACSHA1(key)
-	_, _ = h.Write(input)
-	var out [20]byte
-	copy(out[:], h.Sum(nil))
-	return out
+	return nil
 }

@@ -11,11 +11,10 @@ import (
 )
 
 const (
-	// OuterType is the only verified WIFIIN TCP outer packet type.
+	// OuterType is the WIFIIN TCP stream packet type.
 	OuterType byte = 0x03
-	// LegacyOuterType is intentionally not selected by any production API.
-	// Its server-side semantics remain unverified.
-	LegacyOuterType byte = 0x23
+	// UOTOuterType selects WIFIIN's UDP-over-TCP stream protocol.
+	UOTOuterType byte = 0x23
 
 	providerProduct = "cc.fancast.major"
 	providerOS      = "MAC"
@@ -65,21 +64,35 @@ type OutboundHeader struct {
 	Stream cipher.Stream
 }
 
-// NewOutboundHeader constructs the verified type-0x03 packet using a freshly
-// random IV from entropy. The returned Stream continues encrypting subsequent
-// application bytes; it must be used only for this connection's client->server
-// direction.
+// NewOutboundHeader constructs a WIFIIN TCP packet using a fresh random IV.
+// The returned Stream continues encrypting application bytes for this
+// connection's client-to-server direction.
 func NewOutboundHeader(key []byte, targetHost string, targetPort uint16, providerExtra string) (*OutboundHeader, error) {
-	var iv [IVSize]byte
-	if _, err := io.ReadFull(rand.Reader, iv[:]); err != nil {
-		return nil, fmt.Errorf("wifiin: read outbound IV: %w", err)
-	}
-	return NewOutboundHeaderWithIV(key, targetHost, targetPort, providerExtra, iv)
+	return newOutboundHeader(key, targetHost, targetPort, providerExtra, OuterType, rand.Reader)
+}
+
+// NewUOTOutboundHeader constructs the initial packet for a WIFIIN
+// UDP-over-TCP stream. targetHost and targetPort identify the selected WIFIIN
+// node itself; individual UDP destinations are carried by UOT frames.
+func NewUOTOutboundHeader(key []byte, targetHost string, targetPort uint16, providerExtra string) (*OutboundHeader, error) {
+	return newOutboundHeader(key, targetHost, targetPort, providerExtra, UOTOuterType, rand.Reader)
 }
 
 // NewOutboundHeaderWithIV is deterministic for a supplied IV. It exists for
 // conformance tests and callers that already obtained one fresh random IV.
 func NewOutboundHeaderWithIV(key []byte, targetHost string, targetPort uint16, providerExtra string, iv [IVSize]byte) (*OutboundHeader, error) {
+	return newOutboundHeaderWithIV(key, targetHost, targetPort, providerExtra, OuterType, iv)
+}
+
+func newOutboundHeader(key []byte, targetHost string, targetPort uint16, providerExtra string, outerType byte, random io.Reader) (*OutboundHeader, error) {
+	var iv [IVSize]byte
+	if _, err := io.ReadFull(random, iv[:]); err != nil {
+		return nil, fmt.Errorf("wifiin: read outbound IV: %w", err)
+	}
+	return newOutboundHeaderWithIV(key, targetHost, targetPort, providerExtra, outerType, iv)
+}
+
+func newOutboundHeaderWithIV(key []byte, targetHost string, targetPort uint16, providerExtra string, outerType byte, iv [IVSize]byte) (*OutboundHeader, error) {
 	plain, err := headerPlaintext(targetHost, targetPort, providerExtra)
 	if err != nil {
 		return nil, err
@@ -94,7 +107,7 @@ func NewOutboundHeaderWithIV(key []byte, targetHost string, targetPort uint16, p
 	// The length covers IV plus encrypted header, but not the trailing port.
 	encryptedLength := IVSize + len(ciphertext)
 	packet := make([]byte, 1+2+encryptedLength+2)
-	packet[0] = OuterType
+	packet[0] = outerType
 	binary.BigEndian.PutUint16(packet[1:3], uint16(encryptedLength))
 	copy(packet[3:3+IVSize], iv[:])
 	copy(packet[3+IVSize:3+encryptedLength], ciphertext)

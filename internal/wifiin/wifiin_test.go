@@ -3,6 +3,7 @@ package wifiin
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"encoding/hex"
 	"errors"
 	"io"
@@ -117,28 +118,32 @@ func TestHandshakeReaderRejectsInvalidOrTruncatedACK(t *testing.T) {
 	}
 }
 
-func TestCandidateUDPDeterministicAndDisabled(t *testing.T) {
+func TestUOTHandshakeAndFrameDeterministic(t *testing.T) {
 	key := DeriveKey("password")
-	request := append([]byte{0, 0, 0, 3, 11}, []byte("example.com")...)
-	request = append(request, 1, 187)
-	request = append(request, []byte("hello")...)
-	got, err := EncodeCandidateUDPTestOnly(key[:], request, bytes.NewReader([]byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}))
+	var iv [IVSize]byte
+	for index := range iv {
+		iv[index] = byte(index)
+	}
+	header, err := newOutboundHeaderWithIV(key[:], "192.0.2.1", 443, "|provider-token|cc.fancast.major|order|user|MAC|1.0.46", UOTOuterType, iv)
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "000102030405060708090a0b0c0d0e0fd0c0eb41b2ad02a04efa791b7f7a6a2ab7811f1d"
-	if encoded := hex.EncodeToString(got); encoded != want {
-		t.Fatalf("candidate UDP = %s, want %s", encoded, want)
+	if header.Packet[0] != UOTOuterType {
+		t.Fatalf("outer type = %#x, want %#x", header.Packet[0], UOTOuterType)
 	}
-	decoded, err := DecodeCandidateUDPTestOnly(key[:], got)
+
+	request := []byte{0, 0, 0, 1, 192, 0, 2, 1, 1, 187, 'h', 'e', 'l', 'l', 'o'}
+	var wire bytes.Buffer
+	writer, err := NewUOTWriter(&wire)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(decoded, request) {
-		t.Fatalf("decoded UDP = %x, want %x", decoded, request)
+	if err := writer.WriteSOCKSDatagram(0xbeef, request); err != nil {
+		t.Fatal(err)
 	}
-	if UDPEnabled() {
-		t.Fatal("candidate UDP must remain unavailable without a live fixture")
+	want := "000e01c000020101bbbeef68656c6c6f"
+	if got := hex.EncodeToString(wire.Bytes()); got != want {
+		t.Fatalf("UOT frame = %s, want %s", got, want)
 	}
 }
 
@@ -179,59 +184,62 @@ func TestCFBContextsPreserveArbitraryWriteBoundaries(t *testing.T) {
 	}
 }
 
-func TestCandidateUDPAllAddressFormsAndLegacyOTAVectors(t *testing.T) {
-	key := DeriveKey("password")
-	iv := []byte{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15}
-	ipv6Request := append([]byte{0, 0, 0, 4, 0x20, 1, 0x0d, 0xb8}, make([]byte, 11)...)
-	ipv6Request = append(ipv6Request, 1, 0, 53, 'd', 'a', 't', 'a')
+func TestUOTReaderHandlesAddressFormsFragmentationAndKeepalive(t *testing.T) {
 	cases := []struct {
 		name    string
-		request []byte
-		want    string
+		address []byte
+		flowID  uint16
+		payload []byte
 	}{
-		{"ipv4", []byte{0, 0, 0, 1, 192, 0, 2, 1, 31, 144, 'x'}, "000102030405060708090a0b0c0d0e0fd20b8e3bd2dfe2b4"},
-		{"ipv6", ipv6Request, "000102030405060708090a0b0c0d0e0fd7eb8f346bc072cc2bd41a74127bd142bab4f415343de0"},
+		{"ipv4", []byte{1, 192, 0, 2, 1, 0, 53}, 0x1234, []byte("v4")},
+		{"domain", append(append([]byte{3, 11}, []byte("example.com")...), 1, 187), 0xbeef, []byte("name")},
+		{"ipv6", append(append([]byte{4, 0x20, 1, 0x0d, 0xb8}, make([]byte, 12)...), 0, 53), 7, []byte("v6")},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := EncodeCandidateUDPTestOnly(key[:], tc.request, bytes.NewReader(iv))
+			body := append([]byte(nil), tc.address...)
+			body = binary.BigEndian.AppendUint16(body, tc.flowID)
+			body = append(body, tc.payload...)
+			frame := []byte{0, 0, 0, 0}
+			binary.BigEndian.PutUint16(frame[2:4], uint16(len(body)))
+			frame = append(frame, body...)
+			reader, err := NewUOTReader(&chunkReader{chunks: [][]byte{frame[:1], frame[1:5], frame[5:]}})
 			if err != nil {
 				t.Fatal(err)
 			}
-			if encoded := hex.EncodeToString(got); encoded != tc.want {
-				t.Fatalf("encoded = %s, want %s", encoded, tc.want)
-			}
-			decoded, err := DecodeCandidateUDPTestOnly(key[:], got)
+			output := make([]byte, 1<<16-1)
+			n, flowID, err := reader.ReadSOCKSDatagram(output)
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(decoded, tc.request) {
-				t.Fatalf("decoded = %x, want %x", decoded, tc.request)
+			want := append([]byte{0, 0, 0}, tc.address...)
+			want = append(want, tc.payload...)
+			if flowID != tc.flowID || !bytes.Equal(output[:n], want) {
+				t.Fatalf("decoded = %x flow=%#x, want %x flow=%#x", output[:n], flowID, want, tc.flowID)
 			}
 		})
 	}
-
-	initial, err := LegacyInitialOTATestOnly(key[:], iv, []byte{1, 127, 0, 0, 1, 0, 80})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := hex.EncodeToString(initial), "c2b48e39d2c0227d29e272a6108a49bda9"; got != want {
-		t.Fatalf("initial OTA = %s, want %s", got, want)
-	}
-	chunk, err := LegacyChunkOTATestOnly(iv, 7, []byte("chunk"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if got, want := hex.EncodeToString(chunk), "00059bfd534846906ce4b5476368756e6b"; got != want {
-		t.Fatalf("chunk OTA = %s, want %s", got, want)
-	}
 }
 
-func TestCandidateUDPRejectsFragments(t *testing.T) {
-	key := DeriveKey("password")
-	_, err := EncodeCandidateUDPTestOnly(key[:], []byte{0, 0, 1, 1, 127, 0, 0, 1, 0, 80}, bytes.NewReader(make([]byte, IVSize)))
-	if !errors.Is(err, errFragmentedUDP) {
+func TestUOTRejectsFragmentsAndMalformedFrames(t *testing.T) {
+	writer, err := NewUOTWriter(io.Discard)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.WriteSOCKSDatagram(1, []byte{0, 0, 1, 1, 127, 0, 0, 1, 0, 80}); !errors.Is(err, ErrFragmentedUDP) {
 		t.Fatalf("fragment error = %v", err)
+	}
+	domain := append([]byte{0, 0, 0, 3, 11}, []byte("example.com")...)
+	domain = append(domain, 0, 53)
+	if err := writer.WriteSOCKSDatagram(1, domain); !errors.Is(err, ErrUnsupportedUDPAddress) {
+		t.Fatalf("domain address error = %v", err)
+	}
+	reader, err := NewUOTReader(bytes.NewReader([]byte{0, 1, 0xff}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := reader.ReadSOCKSDatagram(make([]byte, 32)); !errors.Is(err, ErrInvalidUOTFrame) {
+		t.Fatalf("malformed frame error = %v", err)
 	}
 }
 

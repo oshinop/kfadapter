@@ -2,6 +2,7 @@ package socks
 
 import (
 	"context"
+	"crypto/cipher"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -940,28 +941,72 @@ func TestSOCKSServeDoesNotImposeListenerAddressPolicy(t *testing.T) {
 	}
 }
 
-func TestSOCKSRejectsBindAndUDPWithoutUpstreamTraffic(t *testing.T) {
-	for _, command := range []byte{commandBind, commandUDP} {
-		t.Run(strconv.Itoa(int(command)), func(t *testing.T) {
-			fixture := newSOCKSFixture(t)
-			server := fixture.newServer(t)
-			client, done := startConnection(t, server)
-			defer client.Close()
-			socksAuthenticate(t, client, fixture.first)
-			request := socksRequest(addressIPv4, []byte{0, 0, 0, 0}, 0)
-			request[1] = command
-			if _, err := client.Write(request); err != nil {
-				t.Fatal(err)
-			}
-			if code := readReplyCode(t, client); code != replyCommandUnsupported {
-				t.Fatalf("command %#x reply = %#x, want %#x", command, code, replyCommandUnsupported)
-			}
-			awaitHandle(t, done)
-			if calls := fixture.callCount(); calls != 0 {
-				t.Fatalf("unsupported command emitted %d upstream dial(s)", calls)
-			}
-		})
+func TestSOCKSRejectsBindWithoutUpstreamTraffic(t *testing.T) {
+	fixture := newSOCKSFixture(t)
+	server := fixture.newServer(t)
+	client, done := startConnection(t, server)
+	defer client.Close()
+	socksAuthenticate(t, client, fixture.first)
+	request := socksRequest(addressIPv4, []byte{0, 0, 0, 0}, 0)
+	request[1] = commandBind
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
 	}
+	if code := readReplyCode(t, client); code != replyCommandUnsupported {
+		t.Fatalf("BIND reply = %#x, want %#x", code, replyCommandUnsupported)
+	}
+	awaitHandle(t, done)
+	if calls := fixture.callCount(); calls != 0 {
+		t.Fatalf("unsupported command emitted %d upstream dial(s)", calls)
+	}
+}
+
+func TestSOCKSUDPAssociateRelaysOverWIFIINUOT(t *testing.T) {
+	fixture := newSOCKSFixture(t)
+	server := fixture.newServer(t)
+	client, done := startConnection(t, server)
+	socksAuthenticate(t, client, fixture.first)
+	request := socksRequest(addressIPv4, []byte{0, 0, 0, 0}, 0)
+	request[1] = commandUDP
+	if _, err := client.Write(request); err != nil {
+		t.Fatal(err)
+	}
+	var reply [10]byte
+	if _, err := io.ReadFull(client, reply[:]); err != nil {
+		t.Fatal(err)
+	}
+	if reply[0] != version5 || reply[1] != replySucceeded || reply[2] != 0 || reply[3] != addressIPv4 {
+		t.Fatalf("UDP ASSOCIATE reply = %x", reply)
+	}
+	proxyAddress := &net.UDPAddr{IP: net.IP(append([]byte(nil), reply[4:8]...)), Port: int(binary.BigEndian.Uint16(reply[8:]))}
+	udpClient, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer udpClient.Close()
+	datagram := []byte{0, 0, 0, addressIPv4, 192, 0, 2, 1, 0, 53, 'd', 'n', 's', '-', 'q', 'u', 'e', 'r', 'y'}
+	if _, err := udpClient.WriteToUDP(datagram, proxyAddress); err != nil {
+		t.Fatal(err)
+	}
+	if err := udpClient.SetReadDeadline(time.Now().Add(time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	response := make([]byte, 512)
+	n, _, err := udpClient.ReadFromUDP(response)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(response[:n]) != string(datagram) {
+		t.Fatalf("UDP response = %x, want %x", response[:n], datagram)
+	}
+	call := fixture.lastCall(t)
+	if call.targetHost != fixture.nodeOne.Host {
+		t.Fatalf("UOT handshake target = %q, want selected node %q", call.targetHost, fixture.nodeOne.Host)
+	}
+	if err := client.Close(); err != nil {
+		t.Fatal(err)
+	}
+	awaitHandle(t, done)
 }
 
 func TestSOCKSRejectsUnsupportedAddressType(t *testing.T) {
@@ -1151,7 +1196,7 @@ func (f *socksFixture) dial(_ context.Context, network, upstream string) (net.Co
 func (f *socksFixture) serveUpstream(connection net.Conn, upstream string) {
 	defer connection.Close()
 	var prefix [3]byte
-	if _, err := io.ReadFull(connection, prefix[:]); err != nil || prefix[0] != wifiin.OuterType {
+	if _, err := io.ReadFull(connection, prefix[:]); err != nil || (prefix[0] != wifiin.OuterType && prefix[0] != wifiin.UOTOuterType) {
 		return
 	}
 	encryptedLength := int(binary.BigEndian.Uint16(prefix[1:]))
@@ -1179,9 +1224,40 @@ func (f *socksFixture) serveUpstream(connection net.Conn, upstream string) {
 	if err != nil {
 		return
 	}
-	response := []byte("tunnel-response")
-	encrypt.XORKeyStream(response, response)
-	_, _ = connection.Write(append(append([]byte{0, 0, 0}, serverIV...), response...))
+	if prefix[0] == wifiin.OuterType {
+		response := []byte("tunnel-response")
+		encrypt.XORKeyStream(response, response)
+		_, _ = connection.Write(append(append([]byte{0, 0, 0}, serverIV...), response...))
+		return
+	}
+	if _, err := connection.Write([]byte{0, 0, 0}); err != nil {
+		return
+	}
+	uotReader, err := wifiin.NewUOTReader(&cipher.StreamReader{S: decrypt, R: connection})
+	if err != nil {
+		return
+	}
+	uotWriter, err := wifiin.NewUOTWriter(&cipher.StreamWriter{S: encrypt, W: connection})
+	if err != nil {
+		return
+	}
+	serverIVSent := false
+	for {
+		datagram := make([]byte, maxUDPDatagramSize)
+		n, flowID, err := uotReader.ReadSOCKSDatagram(datagram)
+		if err != nil {
+			return
+		}
+		if !serverIVSent {
+			if _, err := connection.Write(serverIV); err != nil {
+				return
+			}
+			serverIVSent = true
+		}
+		if err := uotWriter.WriteSOCKSDatagram(flowID, datagram[:n]); err != nil {
+			return
+		}
+	}
 }
 
 func holdWIFIINHandshake(connection net.Conn) {
