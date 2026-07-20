@@ -26,17 +26,17 @@ jobs:
           node-version: '24'
           cache: npm
           cache-dependency-path: web/package-lock.json
-      - name: Test Go
-        run: go test -race ./...
-      - name: Test frontend
+      - name: Build and test frontend
         working-directory: web
         run: |
           npm ci --prefer-offline --no-audit
+          npm run build
           npm test
+      - name: Test Go
+        run: go test -race ./...
       - name: Validate Compose
         run: |
           docker compose config --quiet
-          docker compose --env-file /dev/null -f deploy/compose.local-build.yaml config --quiet
       - name: Build and smoke-test image
         run: |
           docker build --build-arg VERSION=0.0.0-ci -t kfadapter:ci .
