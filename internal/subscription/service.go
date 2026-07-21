@@ -421,7 +421,7 @@ func (s *Service) CommitRuntimeSnapshot(ctx context.Context, plan RuntimeCommitP
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	if s == nil || snapshot == nil || !snapshot.Session.Valid() || snapshot.Session.UserID != plan.userID {
+	if s == nil || snapshot == nil || !snapshot.Sessions.Valid() || snapshot.Sessions.UserID() != plan.userID {
 		return nil, state.ErrAccountChanged
 	}
 	s.mu.Lock()
@@ -769,7 +769,7 @@ func ValidatePersistentState(persistent state.PersistentState) error {
 		}
 		links := make([]Link, 0, len(lastGood.Nodes))
 		for _, node := range lastGood.Nodes {
-			credential, err := selector.Derive(selector.NodeIdentity{Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
+			credential, err := selector.Derive(selector.NodeIdentity{NodeID: node.ID, Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
 			if err != nil || credential.Selector != node.Selector {
 				return errRenderedSubscriptionMismatch
 			}
@@ -782,7 +782,7 @@ func ValidatePersistentState(persistent state.PersistentState) error {
 		if err != nil || rendered != lastGood.RenderedSubscription {
 			legacyLinks := make([]Link, 0, len(lastGood.Nodes))
 			for _, node := range lastGood.Nodes {
-				credential, deriveErr := selector.Derive(selector.NodeIdentity{Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
+				credential, deriveErr := selector.Derive(selector.NodeIdentity{NodeID: node.ID, Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
 				if deriveErr != nil {
 					return errRenderedSubscriptionMismatch
 				}
@@ -811,7 +811,7 @@ func ValidatePersistentState(persistent state.PersistentState) error {
 			if !found || node.Selector != persistedNode.Selector || node.Provider != persistedNode.Provider || node.Host != persistedNode.Host || node.Port != persistedNode.Port || node.Name != persistedNode.Name || node.Group != persistedNode.Group || node.Eligible != persistedNode.Eligible || node.Excluded != persistedNode.Excluded {
 				return errRenderedSubscriptionMismatch
 			}
-			credential, err := selector.Derive(selector.NodeIdentity{Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
+			credential, err := selector.Derive(selector.NodeIdentity{NodeID: node.ID, Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
 			if err != nil || node.Selector != credential.Selector {
 				return errRenderedSubscriptionMismatch
 			}
@@ -874,7 +874,7 @@ func (s *Service) renderNodes(nodes []state.Node, generation state.SubscriptionG
 	links := make([]Link, 0, len(nodes))
 	persisted := make([]state.PersistedNode, 0, len(nodes))
 	for _, node := range nodes {
-		credential, err := selector.Derive(selector.NodeIdentity{Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, generation.SelectorKey, generation.ProxyAuthKey)
+		credential, err := selector.Derive(selector.NodeIdentity{NodeID: node.ID, Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, generation.SelectorKey, generation.ProxyAuthKey)
 		if err != nil {
 			return "", 0, nil, err
 		}
@@ -902,7 +902,7 @@ func (s *Service) renderPersistedNodesAtWithLegacyExclusions(nodes []state.Persi
 	}
 	links := make([]Link, 0, len(nodes))
 	for _, node := range nodes {
-		credential, err := selector.Derive(selector.NodeIdentity{Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, generation.SelectorKey, generation.ProxyAuthKey)
+		credential, err := selector.Derive(selector.NodeIdentity{NodeID: node.ID, Provider: node.Provider, Host: node.Host, Port: int(node.Port)}, generation.SelectorKey, generation.ProxyAuthKey)
 		if err != nil {
 			return "", 0, nil, err
 		}

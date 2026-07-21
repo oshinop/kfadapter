@@ -16,9 +16,12 @@ const (
 	// UOTOuterType selects WIFIIN's UDP-over-TCP stream protocol.
 	UOTOuterType byte = 0x23
 
-	providerProduct = "cc.fancast.major"
-	providerOS      = "MAC"
-	providerVersion = "1.0.46"
+	iosProviderProduct     = "cc.fancast.major"
+	iosProviderOS          = "MAC"
+	iosProviderVersion     = "1.0.46"
+	windowsProviderProduct = "com.wifiin.sdk.invpn.win"
+	windowsProviderOS      = "WINDOWS"
+	windowsProviderVersion = "4.3.30"
 
 	maxTargetHostBytes        = 255
 	maxProviderFieldBytes     = 4096
@@ -33,14 +36,23 @@ var (
 )
 
 // ProviderExtension builds the exact sensitive extension expected by the
-// verified WIFIIN TCP header. Callers must treat its result as secret.
+// verified iOS WIFIIN TCP header. Callers must treat its result as secret.
 func ProviderExtension(providerToken, orderID, userID string) (string, error) {
+	return ProviderExtensionForProfile("ios", providerToken, orderID, userID)
+}
+
+// ProviderExtensionForProfile builds the profile-specific WIFIIN extension.
+func ProviderExtensionForProfile(profile, providerToken, orderID, userID string) (string, error) {
 	for _, field := range []string{providerToken, orderID, userID} {
 		if !validProviderField(field) {
 			return "", ErrInvalidProviderData
 		}
 	}
-	return "|" + providerToken + "|" + providerProduct + "|" + orderID + "|" + userID + "|" + providerOS + "|" + providerVersion, nil
+	product, osName, version, ok := providerExtensionIdentity(profile)
+	if !ok {
+		return "", ErrInvalidProviderData
+	}
+	return "|" + providerToken + "|" + product + "|" + orderID + "|" + userID + "|" + osName + "|" + version, nil
 }
 
 func validProviderField(field string) bool {
@@ -142,16 +154,37 @@ func validASCIIHost(host string) bool {
 	return true
 }
 
-// ValidProviderExtension reports whether extra is a canonical WIFIIN provider extension.
+// ValidProviderExtension reports whether extra is a canonical supported
+// WIFIIN provider extension.
 func ValidProviderExtension(extra string) bool {
+	return ValidProviderExtensionForProfile("ios", extra) || ValidProviderExtensionForProfile("windows", extra)
+}
+
+// ValidProviderExtensionForProfile validates one profile's canonical form.
+func ValidProviderExtensionForProfile(profile, extra string) bool {
 	if len(extra) == 0 || len(extra) > maxProviderExtensionBytes {
 		return false
 	}
+	product, osName, version, ok := providerExtensionIdentity(profile)
+	if !ok {
+		return false
+	}
 	parts := strings.Split(extra, "|")
-	if len(parts) != 7 || parts[0] != "" || parts[2] != providerProduct || parts[5] != providerOS || parts[6] != providerVersion {
+	if len(parts) != 7 || parts[0] != "" || parts[2] != product || parts[5] != osName || parts[6] != version {
 		return false
 	}
 	return validProviderField(parts[1]) && validProviderField(parts[3]) && validProviderField(parts[4])
+}
+
+func providerExtensionIdentity(profile string) (product, osName, version string, ok bool) {
+	switch profile {
+	case "ios":
+		return iosProviderProduct, iosProviderOS, iosProviderVersion, true
+	case "windows":
+		return windowsProviderProduct, windowsProviderOS, windowsProviderVersion, true
+	default:
+		return "", "", "", false
+	}
 }
 
 // HandshakeReader consumes the required plaintext acknowledgement while

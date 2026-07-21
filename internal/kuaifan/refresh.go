@@ -1,4 +1,4 @@
-package control
+package kuaifan
 
 import (
 	"context"
@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"time"
 
+	wireprofile "github.com/kfadapter/kfadapter/internal/kuaifan/profile"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/state"
 )
@@ -19,11 +20,12 @@ var (
 	ErrAuthorityExpired = errors.New("control: authority has expired")
 )
 
-// RefresherConfig configures the serialized control-plane coordinator. All
-// state changes go through Manager; it is the sole publication path for a
-// complete authority-and-lines generation.
+// RefresherConfig configures the serialized KuaiFan coordinator. All state
+// changes go through Manager; it is the sole publication path for a complete
+// refreshed-session, authority, and line generation.
 type RefresherConfig struct {
-	Client          *Client
+	IOSClient       *Client
+	WindowsClient   *Client
 	Manager         *state.Manager
 	SelectorBuilder state.SelectorBuilder
 	// CommitSnapshot is the single final publication hook. When supplied, it
@@ -44,7 +46,7 @@ type RefresherConfig struct {
 
 // Refresher serializes login and refresh with state.Manager's operation lease.
 type Refresher struct {
-	client         *Client
+	clients        [2]*Client
 	manager        *state.Manager
 	builder        state.SelectorBuilder
 	commitSnapshot func(*state.RuntimeSnapshot) error
@@ -55,9 +57,11 @@ type Refresher struct {
 	clock          func() time.Time
 }
 
-// NewRefresher validates the collaborators required to publish snapshots.
+// NewRefresher validates the two distinct profile clients required to publish
+// an aggregate generation.
 func NewRefresher(cfg RefresherConfig) (*Refresher, error) {
-	if cfg.Client == nil || cfg.Manager == nil || cfg.SelectorBuilder == nil {
+	if cfg.IOSClient == nil || cfg.WindowsClient == nil || cfg.Manager == nil || cfg.SelectorBuilder == nil ||
+		cfg.IOSClient.Profile() != state.ClientProfileIOS || cfg.WindowsClient.Profile() != state.ClientProfileWindows {
 		return nil, ErrNoSession
 	}
 	lifetime := cfg.AuthorityLifetime
@@ -91,15 +95,15 @@ func NewRefresher(cfg RefresherConfig) (*Refresher, error) {
 		commitSnapshot = cfg.Manager.Commit
 	}
 	return &Refresher{
-		client: cfg.Client, manager: cfg.Manager, builder: cfg.SelectorBuilder, commitSnapshot: commitSnapshot,
+		clients: [2]*Client{cfg.IOSClient, cfg.WindowsClient}, manager: cfg.Manager,
+		builder: cfg.SelectorBuilder, commitSnapshot: commitSnapshot,
 		lifetime: lifetime, attempts: attempts, backoff: backoff,
 		maxBackoff: maxBackoff, clock: clock,
 	}, nil
 }
 
-// Login performs config selection, one password-login attempt, then authority
-// and line fetches concurrently. It publishes no provisional session: a
-// snapshot is committed only after every protocol response validates.
+// Login authenticates both control profiles and publishes only after both
+// authority/catalog branches form one validated aggregate generation.
 func (r *Refresher) Login(ctx context.Context, input EmailLogin) (err error) {
 	complete, err := r.manager.Begin(state.OperationLogin)
 	if err != nil {
@@ -108,10 +112,7 @@ func (r *Refresher) Login(ctx context.Context, input EmailLogin) (err error) {
 	outcome := state.OutcomeFailed
 	defer func() { complete(outcome) }()
 
-	session, err := r.client.Login(ctx, input)
-	// Strings are immutable and may be copied by the compiler, so this cannot
-	// guarantee physical erasure. It does ensure this coordinator no longer
-	// retains the caller's password while authority and line work proceeds.
+	sessions, err := r.loginBoth(ctx, input)
 	input.Password = ""
 	if err != nil {
 		return err
@@ -119,20 +120,23 @@ func (r *Refresher) Login(ctx context.Context, input EmailLogin) (err error) {
 	if err := r.manager.Transition(state.StateSyncing); err != nil {
 		return err
 	}
-	authority, lines, err := r.fetchAuthorityAndLines(ctx, session, false)
+	profiles, err := r.fetchBothProfiles(ctx, sessions, false)
 	if err != nil {
 		return err
 	}
-	if err := r.commit(session, authority, lines, state.NewAccountSummary(input.Account, false, time.Time{})); err != nil {
+	account, err := aggregateAccount(input.Account, profiles)
+	if err != nil {
+		return err
+	}
+	if err := r.commit(profiles, account); err != nil {
 		return err
 	}
 	outcome = state.OutcomeSucceeded
 	return nil
 }
 
-// Refresh refreshes client configuration, authority, and lines under one lease.
-// It retains the prior complete generation on every failed response; retrying
-// is bounded and restricted to non-rejection, non-schema failures.
+// Refresh rotates both login sessions and refreshes both catalogs under one
+// lease. Any branch failure retains the prior complete generation.
 func (r *Refresher) Refresh(ctx context.Context) (err error) {
 	if expired, expireErr := r.ExpireIfNeeded(r.now()); expireErr != nil || expired {
 		if expireErr != nil {
@@ -148,33 +152,95 @@ func (r *Refresher) Refresh(ctx context.Context) (err error) {
 	defer func() { complete(outcome) }()
 
 	current := r.manager.Current()
-	if current == nil || !current.Session.Valid() {
+	if current == nil || !current.Sessions.Valid() || current.Sessions.Windows == (state.SessionSecrets{}) {
 		return ErrNoSession
 	}
-	userID, err := parsePositiveDecimal(current.Session.UserID)
-	if err != nil {
-		return ErrSchema
-	}
-	configuration, err := retry(ctx, r, func() (ClientConfig, error) {
-		return r.client.FetchClientConfig(ctx)
-	})
+	sessions, err := r.refreshBoth(ctx, current.Sessions)
 	if err != nil {
 		return err
 	}
-	session := LoginSession{
-		UserID:  userID,
-		Token:   current.Session.LoginToken,
-		APIBase: configuration.APIBase,
-	}
-	authority, lines, err := r.fetchAuthorityAndLines(ctx, session, true)
+	profiles, err := r.fetchBothProfiles(ctx, sessions, true)
 	if err != nil {
 		return err
 	}
-	if err := r.commit(session, authority, lines, current.Account); err != nil {
+	account, err := aggregateAccountDisplay(current.Account.Display, profiles)
+	if err != nil {
+		return err
+	}
+	if err := r.commit(profiles, account); err != nil {
 		return err
 	}
 	outcome = state.OutcomeSucceeded
 	return nil
+}
+
+func (r *Refresher) loginBoth(ctx context.Context, input EmailLogin) ([2]LoginSession, error) {
+	return parallelSessions(ctx, r.clients, func(child context.Context, client *Client) (LoginSession, error) {
+		copyInput := input
+		session, err := client.Login(child, copyInput)
+		copyInput.Password = ""
+		if err != nil {
+			return LoginSession{}, err
+		}
+		if client.requiresPostLoginRefresh() {
+			return client.RefreshSession(child, session)
+		}
+		return session, nil
+	})
+}
+
+func (r *Refresher) refreshBoth(ctx context.Context, current state.ClientSessions) ([2]LoginSession, error) {
+	return parallelSessions(ctx, r.clients, func(child context.Context, client *Client) (LoginSession, error) {
+		stored, available := current.For(client.Profile())
+		if !available {
+			return LoginSession{}, ErrNoSession
+		}
+		userID, err := parsePositiveDecimal(stored.UserID)
+		if err != nil {
+			return LoginSession{}, ErrSchema
+		}
+		configuration, err := retry(child, r, func() (ClientConfig, error) {
+			return client.FetchClientConfig(child)
+		})
+		if err != nil {
+			return LoginSession{}, err
+		}
+		session := LoginSession{UserID: userID, Token: stored.LoginToken, APIBase: configuration.APIBase}
+		return retry(child, r, func() (LoginSession, error) { return client.RefreshSession(child, session) })
+	})
+}
+
+func parallelSessions(ctx context.Context, clients [2]*Client, call func(context.Context, *Client) (LoginSession, error)) ([2]LoginSession, error) {
+	child, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		index   int
+		session LoginSession
+		err     error
+	}
+	results := make(chan result, len(clients))
+	for index, client := range clients {
+		go func() {
+			session, err := call(child, client)
+			results <- result{index: index, session: session, err: err}
+		}()
+	}
+	var sessions [2]LoginSession
+	var firstErr error
+	for range clients {
+		result := <-results
+		if result.err != nil && firstErr == nil {
+			firstErr = result.err
+		}
+		sessions[result.index] = result.session
+	}
+	if firstErr != nil {
+		return [2]LoginSession{}, firstErr
+	}
+	if sessions[0].UserID <= 0 || sessions[0].UserID != sessions[1].UserID {
+		return [2]LoginSession{}, ErrSchema
+	}
+	return sessions, nil
 }
 
 // ExpireIfNeeded transitions a usable generation to expired before a new
@@ -197,7 +263,43 @@ func (r *Refresher) ExpireIfNeeded(now time.Time) (bool, error) {
 	return true, nil
 }
 
-func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, session LoginSession, retryRequests bool) (Authority, Lines, error) {
+type completeProfile struct {
+	client    *Client
+	session   LoginSession
+	authority Authority
+	lines     Lines
+}
+
+func (r *Refresher) fetchBothProfiles(ctx context.Context, sessions [2]LoginSession, retryRequests bool) ([2]completeProfile, error) {
+	child, cancel := context.WithCancel(ctx)
+	defer cancel()
+	type result struct {
+		index   int
+		profile completeProfile
+		err     error
+	}
+	results := make(chan result, len(r.clients))
+	for index, client := range r.clients {
+		go func() {
+			authority, lines, err := r.fetchAuthorityAndLines(child, client, sessions[index], retryRequests)
+			if err != nil {
+				cancel()
+			}
+			results <- result{index: index, profile: completeProfile{client: client, session: sessions[index], authority: authority, lines: lines}, err: err}
+		}()
+	}
+	var profiles [2]completeProfile
+	for range r.clients {
+		result := <-results
+		if result.err != nil {
+			return [2]completeProfile{}, result.err
+		}
+		profiles[result.index] = result.profile
+	}
+	return profiles, nil
+}
+
+func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, client *Client, session LoginSession, retryRequests bool) (Authority, Lines, error) {
 	childCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	type result struct {
@@ -210,9 +312,9 @@ func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, session LoginSes
 		var authority Authority
 		var err error
 		if retryRequests {
-			authority, err = retry(childCtx, r, func() (Authority, error) { return r.client.FetchAuthority(childCtx, session) })
+			authority, err = retry(childCtx, r, func() (Authority, error) { return client.FetchAuthority(childCtx, session) })
 		} else {
-			authority, err = r.client.FetchAuthority(childCtx, session)
+			authority, err = client.FetchAuthority(childCtx, session)
 		}
 		if err != nil {
 			cancel()
@@ -225,9 +327,9 @@ func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, session LoginSes
 		var lines Lines
 		var err error
 		if retryRequests {
-			lines, err = retry(childCtx, r, func() (Lines, error) { return r.client.FetchLines(childCtx, session) })
+			lines, err = retry(childCtx, r, func() (Lines, error) { return client.FetchLines(childCtx, session) })
 		} else {
-			lines, err = r.client.FetchLines(childCtx, session)
+			lines, err = client.FetchLines(childCtx, session)
 		}
 		if err != nil {
 			cancel()
@@ -236,7 +338,6 @@ func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, session LoginSes
 		}
 		results <- result{lines: &lines}
 	}()
-
 	var authority Authority
 	var lines Lines
 	for range 2 {
@@ -257,8 +358,30 @@ func (r *Refresher) fetchAuthorityAndLines(ctx context.Context, session LoginSes
 	return authority, lines, nil
 }
 
-func (r *Refresher) commit(session LoginSession, authority Authority, lines Lines, account state.AccountSummary) error {
-	if session.UserID <= 0 || session.Token == "" || authority.ProviderToken == "" || authority.ProviderExtension == "" {
+func aggregateAccount(account string, profiles [2]completeProfile) (state.AccountSummary, error) {
+	return aggregateAccountDisplay(state.RedactAccount(account), profiles)
+}
+
+func aggregateAccountDisplay(display string, profiles [2]completeProfile) (state.AccountSummary, error) {
+	if display == "" || profiles[0].session.UserID <= 0 || profiles[0].session.UserID != profiles[1].session.UserID {
+		return state.AccountSummary{}, ErrSchema
+	}
+	isVIP := profiles[0].session.Profile.IsVIP && profiles[1].session.Profile.IsVIP
+	vipEndsAt := time.Time{}
+	if isVIP {
+		vipEndsAt = profiles[0].session.Profile.VIPEndsAt
+		if other := profiles[1].session.Profile.VIPEndsAt; vipEndsAt.IsZero() || !other.IsZero() && other.Before(vipEndsAt) {
+			vipEndsAt = other
+		}
+		if vipEndsAt.IsZero() {
+			return state.AccountSummary{}, ErrSchema
+		}
+	}
+	return state.AccountSummary{Display: display, IsVIP: isVIP, VIPEndsAt: vipEndsAt}, nil
+}
+
+func (r *Refresher) commit(profiles [2]completeProfile, account state.AccountSummary) error {
+	if profiles[0].session.UserID <= 0 || profiles[0].session.UserID != profiles[1].session.UserID {
 		return ErrSchema
 	}
 	current := r.manager.Current()
@@ -268,32 +391,52 @@ func (r *Refresher) commit(session LoginSession, authority Authority, lines Line
 		generation = current.Generation + 1
 		previous = current.Selectors
 	}
-	nodes, err := nodesFromLines(lines)
+	iosNodes, err := nodesFromLines(profiles[0].lines, state.ClientProfileIOS)
 	if err != nil {
 		return err
 	}
+	windowsNodes, err := nodesFromLines(profiles[1].lines, state.ClientProfileWindows)
+	if err != nil {
+		return err
+	}
+	nodes := mergeProfileNodes(iosNodes, windowsNodes)
 	builtNodes, selectors, err := r.buildSelectors(generation, nodes, previous)
 	if err != nil {
 		return fmt.Errorf("control: build selectors: %w", err)
 	}
 	now := r.now().UTC()
 	snapshot := &state.RuntimeSnapshot{
-		Generation: generation,
-		CreatedAt:  now,
-		ExpiresAt:  now.Add(r.lifetime),
-		Account:    account,
-		Session: state.SessionSecrets{
-			UserID:            formatUserID(session.UserID),
-			LoginToken:        session.Token,
-			ProviderToken:     authority.ProviderToken,
-			TunnelPassword:    authority.EncryptKey,
-			TunnelMethod:      authority.EncryptType,
-			ProviderExtension: authority.ProviderExtension,
+		Generation: generation, CreatedAt: now, ExpiresAt: now.Add(r.lifetime), Account: account,
+		Sessions: state.ClientSessions{
+			IOS:     sessionSecrets(profiles[0]),
+			Windows: sessionSecrets(profiles[1]),
 		},
-		Nodes:     builtNodes,
-		Selectors: selectors,
+		Nodes: builtNodes, Selectors: selectors,
 	}
 	return r.commitSnapshot(snapshot)
+}
+
+func sessionSecrets(profile completeProfile) state.SessionSecrets {
+	return state.SessionSecrets{
+		UserID: formatUserID(profile.session.UserID), LoginToken: profile.session.Token,
+		ProviderToken: profile.authority.ProviderToken, TunnelPassword: profile.authority.EncryptKey,
+		TunnelMethod: profile.authority.EncryptType, ProviderExtension: profile.authority.ProviderExtension,
+	}
+}
+
+func mergeProfileNodes(ios, windows []state.Node) []state.Node {
+	merged := make([]state.Node, 0, len(ios)+len(windows))
+	seen := make(map[string]struct{}, len(ios)+len(windows))
+	for _, profileNodes := range [][]state.Node{ios, windows} {
+		for _, node := range profileNodes {
+			if _, duplicate := seen[node.ID]; duplicate {
+				continue
+			}
+			seen[node.ID] = struct{}{}
+			merged = append(merged, node)
+		}
+	}
+	return merged
 }
 
 func (r *Refresher) buildSelectors(snapshotGeneration uint64, nodes []state.Node, previous map[string]state.NodeRef) ([]state.Node, map[string]state.NodeRef, error) {
@@ -385,7 +528,10 @@ func selectorsForGeneration(previous map[string]state.NodeRef, generation uint64
 	return selected
 }
 
-func nodesFromLines(lines Lines) ([]state.Node, error) {
+func nodesFromLines(lines Lines, profile state.ClientProfile) ([]state.Node, error) {
+	if !profile.Valid() {
+		return nil, ErrSchema
+	}
 	groups := make(map[string]string, len(lines.Groups))
 	for _, group := range lines.Groups {
 		groups[group.ID] = group.Name
@@ -393,15 +539,11 @@ func nodesFromLines(lines Lines) ([]state.Node, error) {
 	seen := make(map[string]struct{}, len(lines.Lines))
 	nodes := make([]state.Node, 0, len(lines.Lines))
 	for _, line := range lines.Lines {
-		identity, err := selector.Canonicalize(selector.NodeIdentity{
-			Provider: line.Provider,
-			Host:     line.Host,
-			Port:     int(line.Port),
-		})
+		identity, err := selector.Canonicalize(selector.NodeIdentity{Provider: line.Provider, Host: line.Host, Port: int(line.Port)})
 		if err != nil {
 			return nil, fmt.Errorf("%w: canonical node identity", ErrSchema)
 		}
-		id := nodeID(identity)
+		id := nodeID(identity, line.GroupID)
 		if _, duplicate := seen[id]; duplicate {
 			continue
 		}
@@ -411,26 +553,19 @@ func nodesFromLines(lines Lines) ([]state.Node, error) {
 			groupName = groups[line.GroupID]
 		}
 		nodes = append(nodes, state.Node{
-			ID:        id,
-			Provider:  identity.Provider,
-			Host:      identity.Host,
-			Port:      identity.Port,
-			Name:      line.Label,
-			Group:     groupName,
-			Model:     line.Model,
-			Weight:    line.Weight,
-			Auto:      line.Auto,
-			Eligible:  true,
-			Health:    state.NodeHealthUnknown,
-			UDPHealth: state.UDPHealthUnavailable,
+			ID: id, Provider: identity.Provider, ClientProfile: profile, Host: identity.Host,
+			Port: identity.Port, Name: line.Label, Group: groupName, Model: line.Model,
+			Weight: line.Weight, Auto: line.Auto, Eligible: line.Eligible,
+			Health: state.NodeHealthUnknown, UDPHealth: state.UDPHealthUnavailable,
 		})
 	}
 	return nodes, nil
 }
 
-func nodeID(identity selector.CanonicalIdentity) string {
-	sum := sha256.Sum256(identity.Fingerprint())
-	return "node_" + base64.RawURLEncoding.EncodeToString(sum[:12])
+func nodeID(identity selector.CanonicalIdentity, groupID string) string {
+	payload := []byte("kuaifan-line\x00" + groupID + "\x00" + identity.Provider + "\x00" + identity.Host + "\x00" + fmt.Sprintf("%d", identity.Port))
+	sum := sha256.Sum256(payload)
+	return "line_" + base64.RawURLEncoding.EncodeToString(sum[:12])
 }
 
 func (r *Refresher) now() time.Time { return r.clock() }
@@ -490,7 +625,7 @@ func retryDelay(r *Refresher, attempt int) time.Duration {
 		base *= 2
 	}
 	// Full jitter prevents synchronized retries. It cannot expose credentials.
-	jitter, err := boundedRandom(r.client.random, int(base/time.Millisecond)+1)
+	jitter, err := wireprofile.RandomInt(r.clients[0].random, int(base/time.Millisecond)+1)
 	if err != nil {
 		return base
 	}

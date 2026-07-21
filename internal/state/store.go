@@ -19,13 +19,21 @@ import (
 
 const (
 	sqliteStateFileName     = "state.db"
-	sqliteSchemaVersion     = 4
+	sqliteSchemaVersion     = 5
 	MaxPersistentStateBytes = 10 << 20
 	maxSQLiteStateBytes     = MaxPersistentStateBytes + 8<<20
 	maxBrowserSessions      = 4096
 )
 
 var sqliteSchemaTables = map[string]int{
+	"schema_version": 0, "state_metadata": 1, "access_token_verifier": 2,
+	"subscription_generation": 3, "preferences": 4, "excluded_node_ids": 5,
+	"last_good": 6, "last_good_nodes": 7, "active_session": 8,
+	"active_session_nodes": 9, "active_session_selectors": 10, "browser_sessions": 11,
+	"active_session_windows": 12, "active_session_node_profiles": 13,
+}
+
+var sqliteSchemaV4Tables = map[string]int{
 	"schema_version": 0, "state_metadata": 1, "access_token_verifier": 2,
 	"subscription_generation": 3, "preferences": 4, "excluded_node_ids": 5,
 	"last_good": 6, "last_good_nodes": 7, "active_session": 8,
@@ -214,6 +222,10 @@ func (s *SQLiteStore) openExistingLocked() error {
 		return corruptDatabase(err)
 	}
 	if err := validateSQLiteJournalMode(db); err != nil {
+		_ = db.Close()
+		return err
+	}
+	if err := migrateSQLiteSchema(db); err != nil {
 		_ = db.Close()
 		return err
 	}
@@ -492,9 +504,54 @@ var sqliteSchemaStatements = []string{
 	`CREATE TABLE active_session_nodes (position INTEGER PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES active_session(id) ON DELETE CASCADE, node_id TEXT NOT NULL, selector TEXT NOT NULL, provider TEXT NOT NULL, host TEXT NOT NULL, port INTEGER NOT NULL, name TEXT NOT NULL, group_name TEXT NOT NULL, model TEXT NOT NULL, weight INTEGER NOT NULL, auto INTEGER NOT NULL, eligible INTEGER NOT NULL, excluded INTEGER NOT NULL, health TEXT NOT NULL, udp_health TEXT NOT NULL, tcp_rtt_ns INTEGER NOT NULL, probed_at_ns INTEGER)`,
 	`CREATE TABLE active_session_selectors (selector TEXT PRIMARY KEY, session_id INTEGER NOT NULL REFERENCES active_session(id) ON DELETE CASCADE, node_id TEXT NOT NULL, generation INTEGER NOT NULL, tombstoned INTEGER NOT NULL, tombstone_until_ns INTEGER)`,
 	`CREATE TABLE browser_sessions (token TEXT PRIMARY KEY, csrf TEXT NOT NULL, expires_at_ns INTEGER NOT NULL)`,
+	`CREATE TABLE active_session_windows (id INTEGER PRIMARY KEY CHECK (id = 1) REFERENCES active_session(id) ON DELETE CASCADE, session_user_id TEXT NOT NULL, session_login_token TEXT NOT NULL, session_provider_token TEXT NOT NULL, session_tunnel_password TEXT NOT NULL, session_tunnel_method TEXT NOT NULL, session_provider_extension TEXT NOT NULL)`,
+	`CREATE TABLE active_session_node_profiles (position INTEGER PRIMARY KEY REFERENCES active_session_nodes(position) ON DELETE CASCADE, client_profile TEXT NOT NULL)`,
+}
+
+func migrateSQLiteSchema(db *sql.DB) error {
+	var version int
+	if err := db.QueryRow("SELECT version FROM schema_version WHERE id = 1").Scan(&version); err != nil {
+		return corruptDatabase(err)
+	}
+	if version == sqliteSchemaVersion {
+		return nil
+	}
+	if version != 4 {
+		return corruptDatabase(errors.New("unsupported SQLite schema version"))
+	}
+	if err := validateSQLiteSchemaDefinition(db, 4, sqliteSchemaV4Tables, sqliteSchemaStatements[:len(sqliteSchemaV4Tables)]); err != nil {
+		return err
+	}
+	if err := configureSQLiteDurability(db); err != nil {
+		return corruptDatabase(err)
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return corruptDatabase(err)
+	}
+	defer tx.Rollback()
+	for _, statement := range sqliteSchemaStatements[len(sqliteSchemaV4Tables):] {
+		if _, err := tx.Exec(statement); err != nil {
+			return corruptDatabase(err)
+		}
+	}
+	if _, err := tx.Exec("INSERT INTO active_session_node_profiles (position, client_profile) SELECT position, ? FROM active_session_nodes", ClientProfileIOS); err != nil {
+		return corruptDatabase(err)
+	}
+	if _, err := tx.Exec("UPDATE schema_version SET version = ? WHERE id = 1", sqliteSchemaVersion); err != nil {
+		return corruptDatabase(err)
+	}
+	if err := tx.Commit(); err != nil {
+		return corruptDatabase(err)
+	}
+	return nil
 }
 
 func validateSQLiteSchema(db *sql.DB) error {
+	return validateSQLiteSchemaDefinition(db, sqliteSchemaVersion, sqliteSchemaTables, sqliteSchemaStatements)
+}
+
+func validateSQLiteSchemaDefinition(db *sql.DB, expectedVersion int, expectedTables map[string]int, expectedStatements []string) error {
 	if err := validateSQLiteJournalMode(db); err != nil {
 		return err
 	}
@@ -510,15 +567,15 @@ func validateSQLiteSchema(db *sql.DB) error {
 		return corruptDatabase(err)
 	}
 	defer rows.Close()
-	tables := make(map[string]struct{}, len(sqliteSchemaTables))
+	tables := make(map[string]struct{}, len(expectedTables))
 	for rows.Next() {
 		var objectType, name, tableName string
 		var definition sql.NullString
 		if err := rows.Scan(&objectType, &name, &tableName, &definition); err != nil {
 			return corruptDatabase(err)
 		}
-		statementIndex, expected := sqliteSchemaTables[name]
-		if !expected || objectType != "table" || tableName != name || !definition.Valid || definition.String != sqliteSchemaStatements[statementIndex] {
+		statementIndex, expected := expectedTables[name]
+		if !expected || objectType != "table" || tableName != name || !definition.Valid || statementIndex >= len(expectedStatements) || definition.String != expectedStatements[statementIndex] {
 			return corruptDatabase(fmt.Errorf("unexpected SQLite schema object %q", name))
 		}
 		if _, duplicate := tables[name]; duplicate {
@@ -529,7 +586,7 @@ func validateSQLiteSchema(db *sql.DB) error {
 	if err := rows.Err(); err != nil {
 		return corruptDatabase(err)
 	}
-	if len(tables) != len(sqliteSchemaTables) {
+	if len(tables) != len(expectedTables) {
 		return corruptDatabase(errors.New("missing SQLite schema tables"))
 	}
 	versions, err := db.Query("SELECT id, version FROM schema_version")
@@ -543,7 +600,7 @@ func validateSQLiteSchema(db *sql.DB) error {
 		if err := versions.Scan(&id, &version); err != nil {
 			return corruptDatabase(err)
 		}
-		if id != 1 || version != sqliteSchemaVersion {
+		if id != 1 || version != expectedVersion {
 			return corruptDatabase(errors.New("unsupported SQLite schema version"))
 		}
 		count++
@@ -795,11 +852,20 @@ func insertActiveSessionTx(tx *sql.Tx, snapshot *RuntimeSnapshot) error {
 	if snapshot == nil {
 		return nil
 	}
-	if _, err := tx.Exec("INSERT INTO active_session (id, generation, created_at_ns, expires_at_ns, account_display, account_is_vip, account_vip_ends_at_ns, session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", snapshot.Generation, nanos(snapshot.CreatedAt), nanos(snapshot.ExpiresAt), snapshot.Account.Display, boolInt(snapshot.Account.IsVIP), nullableNanos(snapshot.Account.VIPEndsAt), snapshot.Session.UserID, snapshot.Session.LoginToken, snapshot.Session.ProviderToken, snapshot.Session.TunnelPassword, snapshot.Session.TunnelMethod, snapshot.Session.ProviderExtension); err != nil {
+	ios := snapshot.Sessions.IOS
+	if _, err := tx.Exec("INSERT INTO active_session (id, generation, created_at_ns, expires_at_ns, account_display, account_is_vip, account_vip_ends_at_ns, session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension) VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", snapshot.Generation, nanos(snapshot.CreatedAt), nanos(snapshot.ExpiresAt), snapshot.Account.Display, boolInt(snapshot.Account.IsVIP), nullableNanos(snapshot.Account.VIPEndsAt), ios.UserID, ios.LoginToken, ios.ProviderToken, ios.TunnelPassword, ios.TunnelMethod, ios.ProviderExtension); err != nil {
 		return corruptDatabase(err)
+	}
+	if windows := snapshot.Sessions.Windows; windows != (SessionSecrets{}) {
+		if _, err := tx.Exec("INSERT INTO active_session_windows (id, session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension) VALUES (1, ?, ?, ?, ?, ?, ?)", windows.UserID, windows.LoginToken, windows.ProviderToken, windows.TunnelPassword, windows.TunnelMethod, windows.ProviderExtension); err != nil {
+			return corruptDatabase(err)
+		}
 	}
 	for index, node := range snapshot.Nodes {
 		if _, err := tx.Exec("INSERT INTO active_session_nodes (position, session_id, node_id, selector, provider, host, port, name, group_name, model, weight, auto, eligible, excluded, health, udp_health, tcp_rtt_ns, probed_at_ns) VALUES (?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)", index, node.ID, node.Selector, node.Provider, node.Host, node.Port, node.Name, node.Group, node.Model, node.Weight, boolInt(node.Auto), boolInt(node.Eligible), boolInt(node.Excluded), string(node.Health), string(node.UDPHealth), int64(node.TCPRTT), nullableNanos(node.ProbedAt)); err != nil {
+			return corruptDatabase(err)
+		}
+		if _, err := tx.Exec("INSERT INTO active_session_node_profiles (position, client_profile) VALUES (?, ?)", index, node.EffectiveClientProfile()); err != nil {
 			return corruptDatabase(err)
 		}
 	}
@@ -943,7 +1009,7 @@ func loadActiveSessionTx(tx *sql.Tx) (*RuntimeSnapshot, error) {
 	var created, expires int64
 	var vipEnds sql.NullInt64
 	var isVIP int64
-	err := tx.QueryRow("SELECT generation, created_at_ns, expires_at_ns, account_display, account_is_vip, account_vip_ends_at_ns, session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension FROM active_session WHERE id = 1").Scan(&snapshot.Generation, &created, &expires, &snapshot.Account.Display, &isVIP, &vipEnds, &snapshot.Session.UserID, &snapshot.Session.LoginToken, &snapshot.Session.ProviderToken, &snapshot.Session.TunnelPassword, &snapshot.Session.TunnelMethod, &snapshot.Session.ProviderExtension)
+	err := tx.QueryRow("SELECT generation, created_at_ns, expires_at_ns, account_display, account_is_vip, account_vip_ends_at_ns, session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension FROM active_session WHERE id = 1").Scan(&snapshot.Generation, &created, &expires, &snapshot.Account.Display, &isVIP, &vipEnds, &snapshot.Sessions.IOS.UserID, &snapshot.Sessions.IOS.LoginToken, &snapshot.Sessions.IOS.ProviderToken, &snapshot.Sessions.IOS.TunnelPassword, &snapshot.Sessions.IOS.TunnelMethod, &snapshot.Sessions.IOS.ProviderExtension)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
@@ -957,7 +1023,11 @@ func loadActiveSessionTx(tx *sql.Tx) (*RuntimeSnapshot, error) {
 	snapshot.CreatedAt = time.Unix(0, created).UTC()
 	snapshot.ExpiresAt = time.Unix(0, expires).UTC()
 	snapshot.Account.VIPEndsAt = timeFromNullable(vipEnds)
-	rows, err := tx.Query("SELECT node_id, selector, provider, host, port, name, group_name, model, weight, auto, eligible, excluded, health, udp_health, tcp_rtt_ns, probed_at_ns FROM active_session_nodes WHERE session_id = 1 ORDER BY position")
+	err = tx.QueryRow("SELECT session_user_id, session_login_token, session_provider_token, session_tunnel_password, session_tunnel_method, session_provider_extension FROM active_session_windows WHERE id = 1").Scan(&snapshot.Sessions.Windows.UserID, &snapshot.Sessions.Windows.LoginToken, &snapshot.Sessions.Windows.ProviderToken, &snapshot.Sessions.Windows.TunnelPassword, &snapshot.Sessions.Windows.TunnelMethod, &snapshot.Sessions.Windows.ProviderExtension)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, corruptDatabase(err)
+	}
+	rows, err := tx.Query("SELECT n.node_id, n.selector, n.provider, p.client_profile, n.host, n.port, n.name, n.group_name, n.model, n.weight, n.auto, n.eligible, n.excluded, n.health, n.udp_health, n.tcp_rtt_ns, n.probed_at_ns FROM active_session_nodes n JOIN active_session_node_profiles p ON p.position = n.position WHERE n.session_id = 1 ORDER BY n.position")
 	if err != nil {
 		return nil, corruptDatabase(err)
 	}
@@ -966,7 +1036,7 @@ func loadActiveSessionTx(tx *sql.Tx) (*RuntimeSnapshot, error) {
 		var port, auto, eligible, excluded, rtt int64
 		var probed sql.NullInt64
 		var health, udp string
-		if err := rows.Scan(&node.ID, &node.Selector, &node.Provider, &node.Host, &port, &node.Name, &node.Group, &node.Model, &node.Weight, &auto, &eligible, &excluded, &health, &udp, &rtt, &probed); err != nil {
+		if err := rows.Scan(&node.ID, &node.Selector, &node.Provider, &node.ClientProfile, &node.Host, &port, &node.Name, &node.Group, &node.Model, &node.Weight, &auto, &eligible, &excluded, &health, &udp, &rtt, &probed); err != nil {
 			rows.Close()
 			return nil, corruptDatabase(err)
 		}

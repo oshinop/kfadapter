@@ -17,7 +17,7 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
-	"github.com/kfadapter/kfadapter/internal/wifiin"
+	"github.com/kfadapter/kfadapter/internal/kuaifan/wifiin"
 )
 
 const (
@@ -96,19 +96,34 @@ const (
 	UDPHealthUnknown     UDPHealth = "unknown"
 )
 
+// ClientProfile identifies the provider control profile whose authority admits
+// a node. Empty profile values are interpreted as iOS only for schema-v4 state
+// migration and test fixtures; newly aggregated nodes always set one explicitly.
+type ClientProfile string
+
+const (
+	ClientProfileIOS     ClientProfile = "ios"
+	ClientProfileWindows ClientProfile = "windows"
+)
+
+func (p ClientProfile) Valid() bool {
+	return p == ClientProfileIOS || p == ClientProfileWindows
+}
+
 // Node is a validated upstream metadata record. It contains no tunnel
 // password, token, authority material, or provider extension.
 type Node struct {
-	ID       string `json:"id"`
-	Selector string `json:"selector"`
-	Provider string `json:"provider"`
-	Host     string `json:"host"`
-	Port     uint16 `json:"port"`
-	Name     string `json:"name"`
-	Group    string `json:"group"`
-	Model    string `json:"model,omitempty"`
-	Weight   int    `json:"weight,omitempty"`
-	Auto     bool   `json:"auto,omitempty"`
+	ID            string        `json:"id"`
+	Selector      string        `json:"selector"`
+	Provider      string        `json:"provider"`
+	ClientProfile ClientProfile `json:"clientProfile"`
+	Host          string        `json:"host"`
+	Port          uint16        `json:"port"`
+	Name          string        `json:"name"`
+	Group         string        `json:"group"`
+	Model         string        `json:"model,omitempty"`
+	Weight        int           `json:"weight,omitempty"`
+	Auto          bool          `json:"auto,omitempty"`
 
 	Eligible  bool          `json:"eligible"`
 	Excluded  bool          `json:"excluded"`
@@ -118,11 +133,19 @@ type Node struct {
 	ProbedAt  time.Time     `json:"probedAt,omitempty"`
 }
 
+// EffectiveClientProfile maps legacy empty values to the original iOS client.
+func (n Node) EffectiveClientProfile() ClientProfile {
+	if n.ClientProfile == "" {
+		return ClientProfileIOS
+	}
+	return n.ClientProfile
+}
+
 // TunnelEligible reports whether a node can be selected by the baseline data
 // plane. Excluded records are presentation history only and never affect local
 // tunnel selection.
 func (n Node) TunnelEligible() bool {
-	return n.Eligible && n.Port != 0 && n.Host != "" && strings.EqualFold(n.Provider, "WIFIIN")
+	return n.Eligible && n.EffectiveClientProfile().Valid() && n.Port != 0 && n.Host != "" && strings.EqualFold(n.Provider, "WIFIIN")
 }
 
 // SelectorBuilder derives opaque selector references without making state
@@ -145,8 +168,8 @@ func (r NodeRef) IsTombstoned(now time.Time) bool {
 	return r.Tombstoned && (r.TombstoneUntil.IsZero() || now.Before(r.TombstoneUntil))
 }
 
-// SessionSecrets contain provider authority material. They are persisted only
-// in the permission-protected SQLite state database by explicit product choice.
+// SessionSecrets contain one client profile's provider authority material.
+// They are persisted only in the permission-protected SQLite state database.
 type SessionSecrets struct {
 	UserID            string `json:"-"`
 	LoginToken        string `json:"-"`
@@ -156,8 +179,7 @@ type SessionSecrets struct {
 	ProviderExtension string `json:"-"`
 }
 
-// Valid reports whether the session fields are non-empty, bounded provider
-// authority material suitable for an in-memory runtime snapshot.
+// Valid reports whether the session fields are non-empty and bounded.
 func (s SessionSecrets) Valid() bool {
 	return validSessionField(s.UserID, maxSessionFieldBytes) &&
 		validSessionField(s.LoginToken, maxSessionFieldBytes) &&
@@ -171,26 +193,62 @@ func validSessionField(value string, limit int) bool {
 	return value != "" && len(value) <= limit && utf8.ValidString(value) && strings.IndexByte(value, 0) < 0
 }
 
-func validPersistedSession(session SessionSecrets) bool {
-	if !session.Valid() || session.TunnelMethod != "aes-256-cfb" || !wifiin.ValidProviderExtension(session.ProviderExtension) {
+func validPersistedSession(profile ClientProfile, session SessionSecrets) bool {
+	if !profile.Valid() || !session.Valid() || session.TunnelMethod != "aes-256-cfb" || !wifiin.ValidProviderExtensionForProfile(string(profile), session.ProviderExtension) {
 		return false
 	}
 	parts := strings.Split(session.ProviderExtension, "|")
-	return parts[1] == session.ProviderToken && parts[4] == session.UserID
+	return len(parts) == 7 && parts[1] == session.ProviderToken && parts[4] == session.UserID
 }
 
 // Clone returns an independent SessionSecrets value. String contents are
 // immutable in Go, so copying does not create a mutable alias.
 func (s SessionSecrets) Clone() SessionSecrets { return s }
 
-// Wipe clears references held by this value. Callers should invoke it once a
-// transient session is no longer required; Go cannot guarantee immediate heap
-// erasure of immutable strings.
+// Wipe clears references held by this value.
 func (s *SessionSecrets) Wipe() {
-	if s == nil {
-		return
+	if s != nil {
+		*s = SessionSecrets{}
 	}
-	*s = SessionSecrets{}
+}
+
+// ClientSessions keeps the independent iOS and Windows authorities together
+// while preserving their profile boundary.
+type ClientSessions struct {
+	IOS     SessionSecrets `json:"-"`
+	Windows SessionSecrets `json:"-"`
+}
+
+func (s ClientSessions) Valid() bool {
+	if !s.IOS.Valid() {
+		return false
+	}
+	return s.Windows == (SessionSecrets{}) || s.Windows.Valid() && s.Windows.UserID == s.IOS.UserID
+}
+
+func (s ClientSessions) UserID() string {
+	if !s.Valid() {
+		return ""
+	}
+	return s.IOS.UserID
+}
+
+func (s ClientSessions) For(profile ClientProfile) (SessionSecrets, bool) {
+	switch profile {
+	case "", ClientProfileIOS:
+		return s.IOS.Clone(), s.IOS.Valid()
+	case ClientProfileWindows:
+		return s.Windows.Clone(), s.Windows.Valid()
+	default:
+		return SessionSecrets{}, false
+	}
+}
+
+func (s *ClientSessions) Wipe() {
+	if s != nil {
+		s.IOS.Wipe()
+		s.Windows.Wipe()
+	}
 }
 
 // AccountSummary deliberately has no raw account identifier. Display must be
@@ -229,7 +287,7 @@ type RuntimeSnapshot struct {
 	CreatedAt  time.Time          `json:"createdAt"`
 	ExpiresAt  time.Time          `json:"expiresAt"`
 	Account    AccountSummary     `json:"account"`
-	Session    SessionSecrets     `json:"-"`
+	Sessions   ClientSessions     `json:"-"`
 	Nodes      []Node             `json:"nodes"`
 	Selectors  map[string]NodeRef `json:"selectors"`
 }
@@ -240,7 +298,6 @@ func (s *RuntimeSnapshot) Clone() *RuntimeSnapshot {
 		return nil
 	}
 	clone := *s
-	clone.Session = s.Session.Clone()
 	clone.Nodes = append([]Node(nil), s.Nodes...)
 	clone.Selectors = make(map[string]NodeRef, len(s.Selectors))
 	for selector, ref := range s.Selectors {
@@ -297,13 +354,16 @@ func ValidateRuntimeSnapshot(snapshot *RuntimeSnapshot) error {
 	if len(snapshot.Nodes) > maxRuntimeNodes || len(snapshot.Selectors) > maxRuntimeSelectorRefs {
 		return fmt.Errorf("%w: runtime snapshot exceeds selector bounds", ErrInvalidSnapshot)
 	}
-	if time.Now().Before(snapshot.ExpiresAt) && !snapshot.Session.Valid() {
-		return fmt.Errorf("%w: incomplete usable session", ErrInvalidSnapshot)
+	if time.Now().Before(snapshot.ExpiresAt) && !snapshot.Sessions.Valid() {
+		return fmt.Errorf("%w: incomplete usable client sessions", ErrInvalidSnapshot)
 	}
 	ids := make(map[string]struct{}, len(snapshot.Nodes))
 	for _, node := range snapshot.Nodes {
 		if err := ValidateNode(node); err != nil {
 			return fmt.Errorf("%w: incomplete node", ErrInvalidSnapshot)
+		}
+		if _, available := snapshot.Sessions.For(node.EffectiveClientProfile()); time.Now().Before(snapshot.ExpiresAt) && !available {
+			return fmt.Errorf("%w: node has no client authority", ErrInvalidSnapshot)
 		}
 		if _, exists := ids[node.ID]; exists {
 			return fmt.Errorf("%w: duplicate node id", ErrInvalidSnapshot)
@@ -706,8 +766,11 @@ func ValidatePersistentState(p PersistentState) error {
 		if err := ValidateRuntimeSnapshot(p.ActiveSession); err != nil {
 			return fmt.Errorf("invalid active session: %w", err)
 		}
-		if !validPersistedSession(p.ActiveSession.Session) || !p.MatchesAccount(p.ActiveSession.Session.UserID) {
+		if !validPersistedSession(ClientProfileIOS, p.ActiveSession.Sessions.IOS) || !p.MatchesAccount(p.ActiveSession.Sessions.UserID()) {
 			return fmt.Errorf("active session does not match durable account binding")
+		}
+		if p.ActiveSession.Sessions.Windows != (SessionSecrets{}) && !validPersistedSession(ClientProfileWindows, p.ActiveSession.Sessions.Windows) {
+			return fmt.Errorf("active Windows session is invalid")
 		}
 		for _, reference := range p.ActiveSession.Selectors {
 			if reference.Generation != p.Subscription.Generation {

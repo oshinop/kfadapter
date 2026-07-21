@@ -662,7 +662,7 @@ func TestNewAdapterRestoresAndClearsPersistedProviderSession(t *testing.T) {
 	if signedOut.manager.State() != state.StateSignedOut {
 		t.Fatalf("state after logout restart = %s", signedOut.manager.State())
 	}
-	if current := signedOut.manager.Current(); current != nil && current.Session.Valid() {
+	if current := signedOut.manager.Current(); current != nil && current.Sessions.Valid() {
 		t.Fatalf("logout restart retained session authority: %#v", current)
 	}
 }
@@ -715,9 +715,9 @@ func seedBoundActiveSession(t *testing.T, dir, socksAddress string) (*state.Runt
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
-		Account: state.NewAccountSummary(account, true, now.Add(24*time.Hour)),
-		Session: state.SessionSecrets{UserID: account, LoginToken: "restored-login", ProviderToken: "restored-provider", TunnelPassword: "restored-tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|restored-provider|cc.fancast.major|order|" + account + "|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary(account, true, now.Add(24*time.Hour)),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: account, LoginToken: "restored-login", ProviderToken: "restored-provider", TunnelPassword: "restored-tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|restored-provider|cc.fancast.major|order|" + account + "|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if _, err := service.CommitRuntimeSnapshot(context.Background(), plan, snapshot); err != nil {
 		_ = store.Close()
@@ -740,7 +740,7 @@ func assertRestoredAdapterSession(t *testing.T, adapter *adapter, expected *stat
 		t.Fatalf("restored manager state = %s", adapter.manager.State())
 	}
 	current := adapter.manager.Current()
-	if current == nil || current.Account != expected.Account || current.Session != expected.Session {
+	if current == nil || current.Account != expected.Account || current.Sessions != expected.Sessions {
 		t.Fatalf("restored session = %#v", current)
 	}
 	status, err := adapter.runtime.Status(context.Background())
@@ -748,7 +748,7 @@ func assertRestoredAdapterSession(t *testing.T, adapter *adapter, expected *stat
 		t.Fatalf("restored refresh schedule status=%#v err=%v", status.ControlPlane, err)
 	}
 	pin, err := adapter.manager.CompactPin(selectorName, subscriptionGeneration, time.Now().UTC())
-	if err != nil || pin.Node.ID != expected.Nodes[0].ID || pin.Session != expected.Session {
+	if err != nil || pin.Node.ID != expected.Nodes[0].ID || pin.Session != expected.Sessions.IOS {
 		t.Fatalf("restored node authority pin=%#v err=%v", pin, err)
 	}
 }

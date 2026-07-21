@@ -14,9 +14,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kfadapter/kfadapter/internal/kuaifan/wifiin"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/state"
-	"github.com/kfadapter/kfadapter/internal/wifiin"
 )
 
 func TestSOCKSConnectAddressFormsAndSelectorIsolation(t *testing.T) {
@@ -485,7 +485,7 @@ func TestSOCKSRevalidatesStalledSessionBeforeDial(t *testing.T) {
 			prepare: func(snapshot *state.RuntimeSnapshot) *state.RuntimeSnapshot {
 				snapshot.Generation++
 				snapshot.CreatedAt = time.Now().UTC()
-				snapshot.Session.LoginToken = "different-login-token"
+				snapshot.Sessions.IOS.LoginToken = "different-login-token"
 				return snapshot
 			},
 		},
@@ -494,7 +494,7 @@ func TestSOCKSRevalidatesStalledSessionBeforeDial(t *testing.T) {
 			prepare: func(snapshot *state.RuntimeSnapshot) *state.RuntimeSnapshot {
 				snapshot.Generation++
 				snapshot.CreatedAt = time.Now().UTC()
-				snapshot.Session.ProviderToken = "renewed-provider-token"
+				snapshot.Sessions.IOS.ProviderToken = "renewed-provider-token"
 				return snapshot
 			},
 		},
@@ -610,7 +610,7 @@ func TestSOCKSFinalAdmissionRejectsInvalidatedHandshake(t *testing.T) {
 				next := fixture.snapshot.Clone()
 				next.Generation++
 				next.CreatedAt = next.CreatedAt.Add(time.Second)
-				next.Session.ProviderToken = "refreshed-provider-token"
+				next.Sessions.IOS.ProviderToken = "refreshed-provider-token"
 				for selectorName, ref := range next.Selectors {
 					ref.Generation = next.Generation
 					next.Selectors[selectorName] = ref
@@ -1037,7 +1037,7 @@ func (s snapshotFixture) SessionCurrentPin(pin state.TunnelPin, now time.Time) b
 	if s.snapshot == nil || !state.SessionUsable(s.snapshot, now) {
 		return false
 	}
-	return samePinAuthority(pin, state.TunnelPin{Session: s.snapshot.Session, ExpiresAt: s.snapshot.ExpiresAt})
+	return samePinAuthority(pin, state.TunnelPin{Session: s.snapshot.Sessions.IOS, ExpiresAt: s.snapshot.ExpiresAt})
 }
 
 type mutableSnapshotSource struct {
@@ -1057,7 +1057,7 @@ func (s *mutableSnapshotSource) SessionCurrentPin(pin state.TunnelPin, now time.
 	if s.snapshot == nil || !state.SessionUsable(s.snapshot, now) {
 		return false
 	}
-	return samePinAuthority(pin, state.TunnelPin{Session: s.snapshot.Session, ExpiresAt: s.snapshot.ExpiresAt})
+	return samePinAuthority(pin, state.TunnelPin{Session: s.snapshot.Sessions.IOS, ExpiresAt: s.snapshot.ExpiresAt})
 }
 
 func (s *mutableSnapshotSource) Set(snapshot *state.RuntimeSnapshot) {
@@ -1074,7 +1074,7 @@ func compactPin(snapshot *state.RuntimeSnapshot, selectorName string, generation
 	if err != nil || ref.Generation != generation {
 		return state.TunnelPin{}, state.ErrSelectorUnknown
 	}
-	return state.TunnelPin{Session: snapshot.Session.Clone(), ExpiresAt: snapshot.ExpiresAt, Node: node, Ref: ref}, nil
+	return state.TunnelPin{Session: snapshot.Sessions.IOS.Clone(), ExpiresAt: snapshot.ExpiresAt, Node: node, Ref: ref}, nil
 }
 
 type dialCall struct {
@@ -1127,11 +1127,11 @@ func newSOCKSFixture(t *testing.T) *socksFixture {
 	}
 	nodeOne := state.Node{ID: "one", Provider: "WIFIIN", Host: "127.0.0.11", Port: 11000, Eligible: true}
 	nodeTwo := state.Node{ID: "two", Provider: "WIFIIN", Host: "127.0.0.12", Port: 11000, Eligible: true}
-	first, ok := registry.Credentials(1, selector.NodeIdentity{Provider: nodeOne.Provider, Host: nodeOne.Host, Port: int(nodeOne.Port)})
+	first, ok := registry.Credentials(1, selector.NodeIdentity{NodeID: nodeOne.ID, Provider: nodeOne.Provider, Host: nodeOne.Host, Port: int(nodeOne.Port)})
 	if !ok {
 		t.Fatal("first credential unavailable")
 	}
-	second, ok := registry.Credentials(1, selector.NodeIdentity{Provider: nodeTwo.Provider, Host: nodeTwo.Host, Port: int(nodeTwo.Port)})
+	second, ok := registry.Credentials(1, selector.NodeIdentity{NodeID: nodeTwo.ID, Provider: nodeTwo.Provider, Host: nodeTwo.Host, Port: int(nodeTwo.Port)})
 	if !ok {
 		t.Fatal("second credential unavailable")
 	}
@@ -1144,14 +1144,14 @@ func newSOCKSFixture(t *testing.T) *socksFixture {
 		Generation: 1,
 		CreatedAt:  now,
 		ExpiresAt:  now.Add(time.Hour),
-		Session: state.SessionSecrets{
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{
 			UserID:            "user",
 			LoginToken:        "login-token",
 			ProviderToken:     "provider-token",
 			TunnelPassword:    "tunnel-password",
 			TunnelMethod:      "aes-256-cfb",
-			ProviderExtension: providerExtra,
-		},
+			ProviderExtension: "|provider-token|cc.fancast.major|order|user|MAC|1.0.46",
+		}},
 		Nodes: []state.Node{nodeOne, nodeTwo},
 		Selectors: map[string]state.NodeRef{
 			first.Selector:  {NodeID: nodeOne.ID, Generation: 1},

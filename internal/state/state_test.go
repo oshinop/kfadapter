@@ -23,10 +23,10 @@ func runtimeSnapshot(generation uint64, user string, expiresAt time.Time) *Runti
 		CreatedAt:  expiresAt.Add(-time.Hour),
 		ExpiresAt:  expiresAt,
 		Account:    AccountSummary{Display: "u•••@example.com", IsVIP: true},
-		Session: SessionSecrets{
+		Sessions: ClientSessions{IOS: SessionSecrets{
 			UserID: user, LoginToken: "login", ProviderToken: "provider",
 			TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|" + user + "|MAC|1.0.46",
-		},
+		}},
 		Nodes: []Node{{
 			ID: "line-1", Selector: "n_example", Provider: "WIFIIN", Host: "node.example.com", Port: 11000,
 			Eligible: true, Health: NodeHealthHealthy, UDPHealth: UDPHealthUnavailable,
@@ -92,17 +92,17 @@ func TestRuntimeStoreCopiesPublishedAndRetrievedSnapshots(t *testing.T) {
 	}
 	original.Nodes[0].Host = "mutated.example"
 	original.Selectors["n_example"] = NodeRef{Tombstoned: true, TombstoneUntil: now.Add(time.Hour)}
-	original.Session.TunnelPassword = "mutated"
+	original.Sessions.IOS.TunnelPassword = "mutated"
 
 	first := store.Current()
-	if first.Nodes[0].Host != "node.example.com" || first.Session.TunnelPassword != "tunnel" || first.Selectors["n_example"].Tombstoned {
+	if first.Nodes[0].Host != "node.example.com" || first.Sessions.IOS.TunnelPassword != "tunnel" || first.Selectors["n_example"].Tombstoned {
 		t.Fatalf("published view was mutated through input: %#v", first)
 	}
 	first.Nodes[0].Host = "caller-mutated.example"
 	first.Selectors["n_example"] = NodeRef{Tombstoned: true, TombstoneUntil: now.Add(time.Hour)}
-	first.Session.Wipe()
+	first.Sessions.Wipe()
 	second := store.Current()
-	if second.Nodes[0].Host != "node.example.com" || !second.Session.Valid() || second.Selectors["n_example"].Tombstoned {
+	if second.Nodes[0].Host != "node.example.com" || !second.Sessions.Valid() || second.Selectors["n_example"].Tombstoned {
 		t.Fatalf("stored view was mutated through Current result: %#v", second)
 	}
 }
@@ -153,7 +153,7 @@ func TestManagerSessionCurrentAdmitsOnlyCurrentAuthority(t *testing.T) {
 	}
 	renewed := runtimeSnapshot(3, "user-1", now.Add(time.Hour))
 	renewed.CreatedAt = now.Add(time.Minute)
-	renewed.Session.TunnelPassword = "renewed-tunnel"
+	renewed.Sessions.IOS.TunnelPassword = "renewed-tunnel"
 	if err := manager.Commit(renewed); err != nil {
 		t.Fatal(err)
 	}
@@ -348,11 +348,11 @@ func TestNonReadyManagerPathsScrubUsableSessions(t *testing.T) {
 		}
 		finish(OutcomeFailed)
 		current := manager.Current()
-		if manager.State() != StateSignedOut || current.Session != (SessionSecrets{}) || SessionUsable(current, now) || len(current.Nodes) != 1 {
+		if manager.State() != StateSignedOut || current.Sessions != (ClientSessions{}) || SessionUsable(current, now) || len(current.Nodes) != 1 {
 			t.Fatalf("failed login retained usable state: %s %#v", manager.State(), current)
 		}
-		if !pinned.Session.Valid() || pinned.Session.TunnelPassword != "tunnel" {
-			t.Fatalf("failed login mutated pinned snapshot: %#v", pinned.Session)
+		if !pinned.Sessions.IOS.Valid() || pinned.Sessions.IOS.TunnelPassword != "tunnel" {
+			t.Fatalf("failed login mutated pinned snapshot: %#v", pinned.Sessions.IOS)
 		}
 	})
 
@@ -368,11 +368,11 @@ func TestNonReadyManagerPathsScrubUsableSessions(t *testing.T) {
 			t.Fatal(err)
 		}
 		current := manager.Current()
-		if manager.State() != StateExpired || current.Session != (SessionSecrets{}) || SessionUsable(current, now) || len(current.Nodes) != 1 {
+		if manager.State() != StateExpired || current.Sessions != (ClientSessions{}) || SessionUsable(current, now) || len(current.Nodes) != 1 {
 			t.Fatalf("error expiry retained usable state: %s %#v", manager.State(), current)
 		}
-		if !pinned.Session.Valid() || pinned.Session.TunnelPassword != "tunnel" {
-			t.Fatalf("error expiry mutated pinned snapshot: %#v", pinned.Session)
+		if !pinned.Sessions.IOS.Valid() || pinned.Sessions.IOS.TunnelPassword != "tunnel" {
+			t.Fatalf("error expiry mutated pinned snapshot: %#v", pinned.Sessions.IOS)
 		}
 	})
 }
@@ -398,7 +398,7 @@ func TestNewManagerScrubsUnusableInitialSessions(t *testing.T) {
 				initial.Selectors = map[string]NodeRef{}
 			}
 			if test.partial {
-				initial.Session.LoginToken = ""
+				initial.Sessions.IOS.LoginToken = ""
 			}
 			caller := initial.Clone()
 			manager, err := NewManager(initial)
@@ -406,11 +406,11 @@ func TestNewManagerScrubsUnusableInitialSessions(t *testing.T) {
 				t.Fatal(err)
 			}
 			current := manager.Current()
-			if manager.State() != test.wantState || current.Session != (SessionSecrets{}) || SessionUsable(current, now) {
+			if manager.State() != test.wantState || current.Sessions != (ClientSessions{}) || SessionUsable(current, now) {
 				t.Fatalf("unusable initial session was published: %s %#v", manager.State(), current)
 			}
-			if initial.Session != caller.Session {
-				t.Fatalf("NewManager mutated caller session: %#v", initial.Session)
+			if initial.Sessions != caller.Sessions {
+				t.Fatalf("NewManager mutated caller session: %#v", initial.Sessions)
 			}
 			if test.withNodes && len(current.Nodes) != 1 {
 				t.Fatalf("NewManager lost retained node metadata: %#v", current.Nodes)
@@ -452,7 +452,7 @@ func TestNewManagerWithSubscriptionRejectsOfflineAndFutureAuthority(t *testing.T
 				}
 				return
 			}
-			if current == nil || current.Session != (SessionSecrets{}) || !current.CreatedAt.Equal(test.createdAt) || !current.ExpiresAt.Equal(test.expiresAt) || SessionUsable(current, now) {
+			if current == nil || current.Sessions != (ClientSessions{}) || !current.CreatedAt.Equal(test.createdAt) || !current.ExpiresAt.Equal(test.expiresAt) || SessionUsable(current, now) {
 				t.Fatalf("expired startup did not retain only original non-secret metadata: %#v", current)
 			}
 		})
@@ -482,8 +482,8 @@ func TestMarkExpiredWipesCurrentSessionAndRetainsPinnedDrainSnapshot(t *testing.
 		t.Fatal(err)
 	}
 	current := manager.Current()
-	if current.Session != (SessionSecrets{}) {
-		t.Fatalf("expired current snapshot retained session secrets: %#v", current.Session)
+	if current.Sessions != (ClientSessions{}) {
+		t.Fatalf("expired current snapshot retained session secrets: %#v", current.Sessions)
 	}
 	if len(current.Nodes) != 1 || current.Nodes[0].ID != "line-1" || manager.State() != StateExpired {
 		t.Fatalf("expiry did not retain non-secret node metadata/state: %#v / %s", current.Nodes, manager.State())
@@ -491,16 +491,16 @@ func TestMarkExpiredWipesCurrentSessionAndRetainsPinnedDrainSnapshot(t *testing.
 	if SessionUsable(current, now.Add(2*time.Minute)) {
 		t.Fatal("expired current snapshot can establish a new tunnel")
 	}
-	if !pinned.Session.Valid() || pinned.Session.TunnelPassword != "tunnel" {
-		t.Fatalf("expiry altered previously pinned drain snapshot: %#v", pinned.Session)
+	if !pinned.Sessions.IOS.Valid() || pinned.Sessions.IOS.TunnelPassword != "tunnel" {
+		t.Fatalf("expiry altered previously pinned drain snapshot: %#v", pinned.Sessions.IOS)
 	}
 	retry, err := manager.Begin(OperationLogin)
 	if err != nil {
 		t.Fatal(err)
 	}
 	retry(OutcomeFailed)
-	if current := manager.Current(); current.Session != (SessionSecrets{}) {
-		t.Fatalf("failed re-login resurrected session material: %#v", current.Session)
+	if current := manager.Current(); current.Sessions != (ClientSessions{}) {
+		t.Fatalf("failed re-login resurrected session material: %#v", current.Sessions)
 	}
 }
 
@@ -528,14 +528,14 @@ func TestFailedRefreshAfterExpiryScrubsCurrentSessionIdempotently(t *testing.T) 
 	}
 	refreshFinish(OutcomeFailed)
 	current := manager.Current()
-	if manager.State() != StateExpired || current.Session != (SessionSecrets{}) || SessionUsable(current, now) {
+	if manager.State() != StateExpired || current.Sessions != (ClientSessions{}) || SessionUsable(current, now) {
 		t.Fatalf("failed refresh did not publish secret-free expired state: %s %#v", manager.State(), current)
 	}
 	if len(current.Nodes) != 1 || current.Nodes[0].ID != "line-1" {
 		t.Fatalf("failed refresh expiry lost node metadata: %#v", current.Nodes)
 	}
-	if !pinned.Session.Valid() || pinned.Session.TunnelPassword != "tunnel" {
-		t.Fatalf("failed refresh expiry mutated pinned relay snapshot: %#v", pinned.Session)
+	if !pinned.Sessions.IOS.Valid() || pinned.Sessions.IOS.TunnelPassword != "tunnel" {
+		t.Fatalf("failed refresh expiry mutated pinned relay snapshot: %#v", pinned.Sessions.IOS)
 	}
 	if err := manager.MarkExpired(now.Add(time.Minute)); err != nil {
 		t.Fatalf("first repeated MarkExpired: %v", err)
@@ -543,8 +543,8 @@ func TestFailedRefreshAfterExpiryScrubsCurrentSessionIdempotently(t *testing.T) 
 	if err := manager.MarkExpired(now.Add(2 * time.Minute)); err != nil {
 		t.Fatalf("second repeated MarkExpired: %v", err)
 	}
-	if current := manager.Current(); current.Session != (SessionSecrets{}) || SessionUsable(current, now.Add(3*time.Minute)) {
-		t.Fatalf("repeated expiry retained or revived session: %#v", current.Session)
+	if current := manager.Current(); current.Sessions != (ClientSessions{}) || SessionUsable(current, now.Add(3*time.Minute)) {
+		t.Fatalf("repeated expiry retained or revived session: %#v", current.Sessions)
 	}
 }
 
@@ -610,9 +610,9 @@ func TestManagerCommitRejectsResurrectionStates(t *testing.T) {
 				t.Fatalf("Commit changed lifecycle state to %s", manager.State())
 			}
 			if (manager.State() == StateSignedOut || manager.State() == StateExpired) && after != nil && SessionUsable(after, time.Now()) {
-				t.Fatalf("Commit resurrected usable session: %#v", after.Session)
+				t.Fatalf("Commit resurrected usable session: %#v", after.Sessions)
 			}
-			if before != nil && (after == nil || after.Generation != before.Generation || after.Session != before.Session) {
+			if before != nil && (after == nil || after.Generation != before.Generation || after.Sessions != before.Sessions) {
 				t.Fatalf("Commit replaced terminal-state snapshot: before=%#v after=%#v", before, after)
 			}
 		})
@@ -637,7 +637,7 @@ func TestRuntimeSnapshotRequiresBoundedFiniteUsableSession(t *testing.T) {
 		t.Fatal("overlong session lifetime accepted")
 	}
 	partial := base.Clone()
-	partial.Session.ProviderToken = ""
+	partial.Sessions.IOS.ProviderToken = ""
 	if !errors.Is(ValidateRuntimeSnapshot(partial), ErrInvalidSnapshot) {
 		t.Fatal("partial future session accepted")
 	}
@@ -721,6 +721,17 @@ func TestSQLiteStoreRoundTripRestartAndNoRawAccessToken(t *testing.T) {
 	persisted.Preferences.RevealEndpoints = true
 	persisted.Preferences.ExcludedNodeIDs["another-node"] = true
 	persisted.ActiveSession = runtimeSnapshot(9, "user-1", time.Now().UTC().Add(time.Hour))
+	persisted.ActiveSession.Sessions.Windows = SessionSecrets{
+		UserID: "user-1", LoginToken: "windows-login", ProviderToken: "windows-provider",
+		TunnelPassword: "wifiin1234", TunnelMethod: "aes-256-cfb",
+		ProviderExtension: "|windows-provider|com.wifiin.sdk.invpn.win|windows-order|user-1|WINDOWS|4.3.30",
+	}
+	persisted.ActiveSession.Nodes = append(persisted.ActiveSession.Nodes, Node{
+		ID: "line-windows", Selector: "n_windows", Provider: "WIFIIN", ClientProfile: ClientProfileWindows,
+		Host: "windows.example", Port: 11000, Name: "windows", Group: "group", Eligible: true,
+		Health: NodeHealthUnknown, UDPHealth: UDPHealthUnavailable,
+	})
+	persisted.ActiveSession.Selectors["n_windows"] = NodeRef{NodeID: "line-windows", Generation: persisted.Subscription.Generation}
 	if err := store.Save(persisted); err != nil {
 		t.Fatalf("Save: %v", err)
 	}
@@ -738,7 +749,11 @@ func TestSQLiteStoreRoundTripRestartAndNoRawAccessToken(t *testing.T) {
 	if loaded.InstallationID != persisted.InstallationID || loaded.Preferences.RefreshPolicy != persisted.Preferences.RefreshPolicy || !loaded.Preferences.RevealEndpoints || !loaded.Preferences.ExcludedNodeIDs["another-node"] {
 		t.Fatalf("persistent aggregate did not round trip: %#v", loaded)
 	}
-	if loaded.ActiveSession == nil || !loaded.ActiveSession.Session.Valid() || loaded.ActiveSession.Session.ProviderToken != persisted.ActiveSession.Session.ProviderToken || loaded.ActiveSession.Selectors["n_example"].Generation != loaded.Subscription.Generation {
+	if loaded.ActiveSession == nil || !loaded.ActiveSession.Sessions.Valid() ||
+		loaded.ActiveSession.Sessions.IOS.ProviderToken != persisted.ActiveSession.Sessions.IOS.ProviderToken ||
+		loaded.ActiveSession.Sessions.Windows != persisted.ActiveSession.Sessions.Windows ||
+		len(loaded.ActiveSession.Nodes) != 2 || loaded.ActiveSession.Nodes[1].ClientProfile != ClientProfileWindows ||
+		loaded.ActiveSession.Selectors["n_example"].Generation != loaded.Subscription.Generation {
 		t.Fatalf("active session did not round trip: %#v", loaded.ActiveSession)
 	}
 	body, err := os.ReadFile(reopened.Path())
@@ -754,6 +769,58 @@ func TestSQLiteStoreRoundTripRestartAndNoRawAccessToken(t *testing.T) {
 	}
 	if got := info.Mode().Perm(); got != 0o600 {
 		t.Fatalf("state.db mode = %#o, want 0600", got)
+	}
+}
+
+func TestSQLiteStoreMigratesSchemaV4ProfilesToIOS(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	persisted := validPersistentSubscriptionState(t)
+	persisted.ActiveSession = runtimeSnapshot(persisted.Subscription.Generation, "user-1", time.Now().UTC().Add(time.Hour))
+	if err := store.Save(persisted); err != nil {
+		t.Fatal(err)
+	}
+	path := store.Path()
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	db, err := openSQLite(path, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, statement := range []string{
+		"DROP TABLE active_session_node_profiles",
+		"DROP TABLE active_session_windows",
+		"UPDATE schema_version SET version = 4 WHERE id = 1",
+	} {
+		if _, err := db.Exec(statement); err != nil {
+			db.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := NewSQLiteStore(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := migrated.Load()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.ActiveSession == nil || len(loaded.ActiveSession.Nodes) != 1 || loaded.ActiveSession.Nodes[0].ClientProfile != ClientProfileIOS || loaded.ActiveSession.Sessions.Windows != (SessionSecrets{}) {
+		t.Fatalf("migrated v4 active session = %#v", loaded.ActiveSession)
+	}
+	var version int
+	if err := migrated.db.QueryRow("SELECT version FROM schema_version WHERE id = 1").Scan(&version); err != nil || version != sqliteSchemaVersion {
+		t.Fatalf("migrated schema version = %d, err=%v", version, err)
 	}
 }
 
@@ -1210,7 +1277,6 @@ func TestSQLiteStoreRestoresExpiresAndRevokesBrowserSessions(t *testing.T) {
 	}
 }
 
-
 func TestExcludedNodeIDsAreStableAndValidated(t *testing.T) {
 	persisted, err := NewPersistentState()
 	if err != nil {
@@ -1350,7 +1416,7 @@ func TestPersistentActiveSessionAuthorityValidatesSemantically(t *testing.T) {
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			candidate := valid.Clone()
-			test.mutate(&candidate.ActiveSession.Session)
+			test.mutate(&candidate.ActiveSession.Sessions.IOS)
 			if err := ValidatePersistentState(candidate); err == nil {
 				t.Fatal("invalid active-session authority accepted")
 			}

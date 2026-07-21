@@ -49,9 +49,11 @@ var lookupIDNA = idna.New(
 	idna.VerifyDNSLength(true),
 )
 
-// NodeIdentity is the upstream identity that determines a selector. Display
-// metadata deliberately does not participate in credential derivation.
+// NodeIdentity is the stable logical line and upstream endpoint that determine
+// a selector. Display metadata deliberately does not participate in credential
+// derivation.
 type NodeIdentity struct {
+	NodeID   string
 	Provider string
 	Host     string
 	Port     int
@@ -59,13 +61,19 @@ type NodeIdentity struct {
 
 // CanonicalIdentity is a validated normal form suitable for fingerprints.
 type CanonicalIdentity struct {
+	NodeID   string
 	Provider string
 	Host     string
 	Port     uint16
 }
 
-// Canonicalize implements the exact provider, host, and port normalization.
+// Canonicalize normalizes a logical ID, provider, host, and port. An empty
+// logical ID is permitted only while constructing a new group-scoped line ID;
+// credential derivation requires a non-empty logical ID.
 func Canonicalize(identity NodeIdentity) (CanonicalIdentity, error) {
+	if len(identity.NodeID) > 256 || strings.IndexByte(identity.NodeID, 0) >= 0 {
+		return CanonicalIdentity{}, fmt.Errorf("%w: invalid logical node id", ErrInvalidIdentity)
+	}
 	provider, err := canonicalProvider(identity.Provider)
 	if err != nil {
 		return CanonicalIdentity{}, err
@@ -77,7 +85,7 @@ func Canonicalize(identity NodeIdentity) (CanonicalIdentity, error) {
 	if identity.Port < 1 || identity.Port > 65535 {
 		return CanonicalIdentity{}, fmt.Errorf("%w: port out of range", ErrInvalidIdentity)
 	}
-	return CanonicalIdentity{Provider: provider, Host: host, Port: uint16(identity.Port)}, nil
+	return CanonicalIdentity{NodeID: identity.NodeID, Provider: provider, Host: host, Port: uint16(identity.Port)}, nil
 }
 
 func canonicalProvider(provider string) (string, error) {
@@ -116,9 +124,9 @@ func canonicalHost(host string) (string, error) {
 	return ascii, nil
 }
 
-// Fingerprint serializes the normative credential input.
+// Fingerprint serializes the current logical-node credential input.
 func (i CanonicalIdentity) Fingerprint() []byte {
-	return []byte("v1\x00" + i.Provider + "\x00" + i.Host + "\x00" + fmt.Sprintf("%d", i.Port))
+	return []byte("credential\x00" + i.NodeID + "\x00" + i.Provider + "\x00" + i.Host + "\x00" + fmt.Sprintf("%d", i.Port))
 }
 
 // Credentials are the opaque username/password placed in a logical SOCKS URL.
@@ -138,12 +146,15 @@ func Derive(identity NodeIdentity, selectorKey, proxyAuthKey []byte) (Credential
 
 // DeriveCanonical is Derive for a previously canonical identity.
 func DeriveCanonical(identity CanonicalIdentity, selectorKey, proxyAuthKey []byte) (Credentials, error) {
+	if identity.NodeID == "" {
+		return Credentials{}, ErrInvalidIdentity
+	}
 	if len(selectorKey) != sha256.Size || len(proxyAuthKey) != sha256.Size {
 		return Credentials{}, ErrInvalidKey
 	}
 	selectorMAC := mac(selectorKey, identity.Fingerprint())
 	selector := selectorPrefix + base64.RawURLEncoding.EncodeToString(selectorMAC[:selectorBytes])
-	passwordMAC := mac(proxyAuthKey, []byte("v1\x00password\x00"+selector))
+	passwordMAC := mac(proxyAuthKey, []byte("selector-password\x00"+selector))
 	password := passwordPrefix + base64.RawURLEncoding.EncodeToString(passwordMAC[:passwordBytes])
 	return Credentials{Selector: selector, Password: password}, nil
 }
@@ -218,7 +229,7 @@ func (r *Registry) AuthenticateAt(selector, password string, _ time.Time) (uint6
 	if keys == nil || !validSelector(selector) || !validPassword(password) {
 		return 0, false
 	}
-	expectedMAC := mac(keys.proxyAuthKey[:], []byte("v1\x00password\x00"+selector))
+	expectedMAC := mac(keys.proxyAuthKey[:], []byte("selector-password\x00"+selector))
 	expected := passwordPrefix + base64.RawURLEncoding.EncodeToString(expectedMAC[:passwordBytes])
 	if subtle.ConstantTimeCompare([]byte(password), []byte(expected)) != 1 {
 		return 0, false
@@ -271,7 +282,7 @@ func (r *Registry) BuildWithTombstones(want uint64, nodes []state.Node, previous
 			return BuildResult{}, ErrDuplicateNodeID
 		}
 		ids[source.ID] = struct{}{}
-		identity, err := Canonicalize(NodeIdentity{Provider: source.Provider, Host: source.Host, Port: int(source.Port)})
+		identity, err := Canonicalize(NodeIdentity{NodeID: source.ID, Provider: source.Provider, Host: source.Host, Port: int(source.Port)})
 		if err != nil {
 			return BuildResult{}, err
 		}

@@ -107,13 +107,13 @@ describe("access token and browser session", () => {
 
   it("shows an invalid account error and clears its password", async () => {
     const api = await openAccountLogin();
-    Object.assign(api, { login: vi.fn().mockRejectedValue(new ApiError({ title: "Rejected", status: 401, code: "invalid_credentials" })) });
+    Object.assign(api, { login: vi.fn().mockRejectedValue(new ApiError({ title: "Unauthorized", status: 401, code: "login_rejected" })) });
     const password = screen.getByLabelText("Password") as HTMLInputElement;
     await userEvent.type(screen.getByLabelText("Email"), "operator@example.com");
     await userEvent.type(password, "wrong-password");
     await userEvent.click(screen.getByRole("button", { name: "Sign in" }));
 
-    expect(await screen.findByText("That email or password was not accepted.")).toBeTruthy();
+    expect(await screen.findByText("The provider rejected that email or password.")).toBeTruthy();
     expect(password.value).toBe("");
   });
 
@@ -183,6 +183,36 @@ describe("access token and browser session", () => {
     await userEvent.click(screen.getByText("East China", { exact: true }));
     expect(await screen.findByRole("treeitem", { name: "Beijing 01" })).toBeTruthy();
     expect(screen.queryByText(/(?:account|nodes) (?:refreshed|updated)/i)).toBeNull();
+  });
+
+  it("renders every logical catalog row supplied by the backend", async () => {
+    const music = Array.from({ length: 5 }, (_, index) => ({
+      ...nodes[0],
+      id: `music-${index + 1}`,
+      name: `音乐/视频专线 · ${index + 1}`,
+      group: "音乐/视频APP专线",
+    }));
+    const catalogNodes: typeof nodes = [
+      ...music,
+      { ...nodes[0], id: "australia-2", name: "澳大利亚 ➩ 中国 · 2", group: "澳洲 ➩ 中国" },
+      { ...nodes[0], id: "australia-7", name: "澳大利亚 ➩ 中国 · 7", group: "澳洲 ➩ 中国" },
+    ];
+    const status = readyStatus();
+    status.nodes = { total: catalogNodes.length, eligible: catalogNodes.length, healthy: catalogNodes.length };
+    status.subscription.nodeCount = catalogNodes.length;
+    render(<App api={makeApi(status, catalogNodes)} />);
+
+    expect(await screen.findByText("7 available")).toBeTruthy();
+    const musicGroup = screen.getByLabelText("音乐/视频APP专线 group");
+    expect(musicGroup.textContent).toContain("5");
+    await userEvent.click(screen.getByText("音乐/视频APP专线", { exact: true }));
+    for (const node of music) expect(screen.getByRole("treeitem", { name: node.name })).toBeTruthy();
+
+    const australiaGroup = screen.getByLabelText("澳洲 ➩ 中国 group");
+    expect(australiaGroup.textContent).toContain("2");
+    await userEvent.click(screen.getByText("澳洲 ➩ 中国", { exact: true }));
+    expect(screen.getByRole("treeitem", { name: "澳大利亚 ➩ 中国 · 2" })).toBeTruthy();
+    expect(screen.getByRole("treeitem", { name: "澳大利亚 ➩ 中国 · 7" })).toBeTruthy();
   });
 
   it.each([

@@ -1,4 +1,4 @@
-// Package wifiin implements the verified WIFIIN TCP tunnel wire format.
+// Package wifiin implements the observed Fanster-branded WIFIIN tunnel wire format.
 package wifiin
 
 import (

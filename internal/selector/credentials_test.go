@@ -35,19 +35,19 @@ func TestLiteralSelectorCredentialVectorAndSingleGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := NodeIdentity{Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
+	identity := NodeIdentity{NodeID: "logical-node", Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
 	canonical, err := Canonicalize(identity)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got, want := hex.EncodeToString(canonical.Fingerprint()), "76310057494649494e006e6f64652e6578616d706c652e636f6d003131303030"; got != want {
+	if got, want := hex.EncodeToString(canonical.Fingerprint()), "63726564656e7469616c006c6f676963616c2d6e6f64650057494649494e006e6f64652e6578616d706c652e636f6d003131303030"; got != want {
 		t.Fatalf("fingerprint = %s", got)
 	}
 	credential, err := Derive(identity, current.SelectorKey, current.ProxyAuthKey)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if credential.Selector != "n_dRrYzOwvhk-TZ2ud" || credential.Password != "p_I-rMzJLcPbFGcNNUwQcLNg8R" {
+	if credential.Selector != "n_mxil1BgwUEdowkbk" || credential.Password != "p_PTcyncorolR0QCpa8NdZV8z8" {
 		t.Fatalf("credential = %#v", credential)
 	}
 	if generations := registry.Generations(); len(generations) != 1 || generations[0] != 1 {
@@ -58,6 +58,13 @@ func TestLiteralSelectorCredentialVectorAndSingleGeneration(t *testing.T) {
 	}
 	if _, ok := registry.Credentials(2, identity); ok {
 		t.Fatal("registry exposed a non-current credential generation")
+	}
+}
+
+func TestDeriveRejectsMissingLogicalNodeID(t *testing.T) {
+	identity := NodeIdentity{Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
+	if _, err := Derive(identity, normativeGeneration(t, 1).SelectorKey, normativeGeneration(t, 1).ProxyAuthKey); !errors.Is(err, ErrInvalidIdentity) {
+		t.Fatalf("missing logical node ID error = %v", err)
 	}
 }
 
@@ -74,7 +81,7 @@ func TestAccountCutoverUsesReplacementRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := NodeIdentity{Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
+	identity := NodeIdentity{NodeID: "node", Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
 	oldCredentials, ok := oldRegistry.Credentials(1, identity)
 	if !ok {
 		t.Fatal("old credentials unavailable")
@@ -131,7 +138,7 @@ func TestRegistryConcurrentReadsAreRaceSafe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	identity := NodeIdentity{Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
+	identity := NodeIdentity{NodeID: "node", Provider: "WIFIIN", Host: "node.example.com", Port: 11000}
 	credential, ok := registry.Credentials(1, identity)
 	if !ok {
 		t.Fatal("credentials unavailable")

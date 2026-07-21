@@ -11,7 +11,7 @@ import (
 	"sync/atomic"
 	"syscall"
 
-	"github.com/kfadapter/kfadapter/internal/wifiin"
+	"github.com/kfadapter/kfadapter/internal/kuaifan/wifiin"
 )
 
 const maxUDPDatagramSize = 1<<16 - 1

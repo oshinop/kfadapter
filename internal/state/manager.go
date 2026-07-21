@@ -119,7 +119,7 @@ func NewManagerWithSubscription(initial *RuntimeSnapshot, subscription Subscript
 		prepared = nil
 	} else if initial != nil && !SessionUsable(initial, now) {
 		prepared = initial.Clone()
-		prepared.Session.Wipe()
+		prepared.Sessions.Wipe()
 		if now.Before(prepared.ExpiresAt) {
 			prepared.ExpiresAt = now.UTC()
 		}
@@ -134,7 +134,7 @@ func NewManagerWithSubscription(initial *RuntimeSnapshot, subscription Subscript
 	}
 	if initial != nil {
 		if SessionUsable(initial, now) {
-			if !manager.bindingKeyConfigured || subscription.Generation == 0 || len(subscription.AccountBinding) != sha256.Size || !matchesAccountBinding(subscription.AccountBinding, bindingKey, initial.Session.UserID) {
+			if !manager.bindingKeyConfigured || subscription.Generation == 0 || len(subscription.AccountBinding) != sha256.Size || !matchesAccountBinding(subscription.AccountBinding, bindingKey, initial.Sessions.UserID()) {
 				return nil, ErrAccountChanged
 			}
 			manager.state = StateReady
@@ -201,7 +201,11 @@ func (m *Manager) CompactPin(selector string, credentialGeneration uint64, now t
 	if ref.Generation != credentialGeneration {
 		return TunnelPin{}, ErrSelectorUnknown
 	}
-	return TunnelPin{Session: current.Session.Clone(), ExpiresAt: current.ExpiresAt, Node: node, Ref: ref}, nil
+	session, available := current.Sessions.For(node.EffectiveClientProfile())
+	if !available {
+		return TunnelPin{}, ErrSelectorUnknown
+	}
+	return TunnelPin{Session: session, ExpiresAt: current.ExpiresAt, Node: node, Ref: ref}, nil
 }
 
 // SessionCurrentPin is the compact final admission check for a SOCKS flow
@@ -218,7 +222,7 @@ func (m *Manager) SessionCurrentPin(pin TunnelPin, now time.Time) bool {
 		current != nil &&
 		current.ExpiresAt.Equal(pin.ExpiresAt) &&
 		SessionUsable(current, now) &&
-		sameSessionAuthority(current.Session, pin.Session)
+		currentSessionMatchesPin(current, pin)
 }
 
 // InstallSubscriptionGeneration installs a durable candidate only while an
@@ -311,7 +315,19 @@ func (m *Manager) SessionCurrent(pinned *RuntimeSnapshot, now time.Time) bool {
 		current != nil &&
 		current.ExpiresAt.Equal(pinned.ExpiresAt) &&
 		SessionUsable(current, now) &&
-		sameSessionAuthority(current.Session, pinned.Session)
+		sameClientSessions(current.Sessions, pinned.Sessions)
+}
+
+func sameClientSessions(left, right ClientSessions) bool {
+	return sameSessionAuthority(left.IOS, right.IOS) && sameSessionAuthority(left.Windows, right.Windows)
+}
+
+func currentSessionMatchesPin(current *RuntimeSnapshot, pin TunnelPin) bool {
+	if current == nil {
+		return false
+	}
+	session, available := current.Sessions.For(pin.Node.EffectiveClientProfile())
+	return available && sameSessionAuthority(session, pin.Session)
 }
 
 // sameSessionAuthority compares all source authority material without making
@@ -427,7 +443,7 @@ func (m *Manager) finish(lease uint64, operation Operation, outcome Outcome) {
 		return
 	}
 	current := m.runtime.Current()
-	if current != nil && current.Session.Valid() {
+	if current != nil && current.Sessions.Valid() {
 		if !current.ExpiresAt.IsZero() && !time.Now().Before(current.ExpiresAt) {
 			m.expireLocked(time.Now())
 		} else {
@@ -483,8 +499,8 @@ func (m *Manager) Commit(snapshot *RuntimeSnapshot) error {
 	if err := ValidateRuntimeSnapshot(snapshot); err != nil {
 		return err
 	}
-	if !snapshot.Session.Valid() {
-		return fmt.Errorf("%w: incomplete session", ErrInvalidSnapshot)
+	if !snapshot.Sessions.Valid() {
+		return fmt.Errorf("%w: incomplete client sessions", ErrInvalidSnapshot)
 	}
 	hasEligible := false
 	for _, node := range snapshot.Nodes {
@@ -505,7 +521,7 @@ func (m *Manager) Commit(snapshot *RuntimeSnapshot) error {
 	if m.runtime.snapshot.Load() != nil && snapshot.Generation <= m.runtime.snapshot.Load().Generation {
 		return fmt.Errorf("%w: non-monotonic generation", ErrInvalidSnapshot)
 	}
-	if !m.bindingKeyConfigured || m.subscription.Generation == 0 || len(m.subscription.AccountBinding) != sha256.Size || !matchesAccountBinding(m.subscription.AccountBinding, m.accountBindingKey, snapshot.Session.UserID) {
+	if !m.bindingKeyConfigured || m.subscription.Generation == 0 || len(m.subscription.AccountBinding) != sha256.Size || !matchesAccountBinding(m.subscription.AccountBinding, m.accountBindingKey, snapshot.Sessions.UserID()) {
 		return ErrAccountChanged
 	}
 	m.runtime.replace(snapshot)
@@ -539,7 +555,7 @@ func (m *Manager) SignOut() {
 func (m *Manager) signOutLocked() {
 	current := m.runtime.Current()
 	if current != nil {
-		current.Session.Wipe()
+		current.Sessions.Wipe()
 		current.Account = AccountSummary{}
 		m.runtime.replace(current)
 	}
@@ -574,7 +590,7 @@ func (m *Manager) expireLocked(now time.Time) {
 	current := m.runtime.Current()
 	if current != nil {
 		current.ExpiresAt = now.UTC()
-		current.Session.Wipe()
+		current.Sessions.Wipe()
 		m.runtime.replace(current)
 	}
 	m.state = StateExpired
@@ -583,6 +599,5 @@ func (m *Manager) expireLocked(now time.Time) {
 // SessionUsable reports whether the supplied pinned snapshot may establish a
 // new tunnel at now. Existing relays deliberately do not re-check this value.
 func SessionUsable(snapshot *RuntimeSnapshot, now time.Time) bool {
-	return snapshot != nil && snapshot.Session.Valid() && !snapshot.CreatedAt.IsZero() && !snapshot.ExpiresAt.IsZero() && !now.Before(snapshot.CreatedAt) && now.Before(snapshot.ExpiresAt)
+	return snapshot != nil && snapshot.Sessions.Valid() && !snapshot.CreatedAt.IsZero() && !snapshot.ExpiresAt.IsZero() && !now.Before(snapshot.CreatedAt) && now.Before(snapshot.ExpiresAt)
 }
-

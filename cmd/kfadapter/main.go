@@ -20,7 +20,7 @@ import (
 
 	"github.com/kfadapter/kfadapter/internal/app"
 	"github.com/kfadapter/kfadapter/internal/config"
-	"github.com/kfadapter/kfadapter/internal/control"
+	"github.com/kfadapter/kfadapter/internal/kuaifan"
 	"github.com/kfadapter/kfadapter/internal/lifecycle"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/socks"
@@ -241,15 +241,18 @@ func newAdapterAtStateDirectory(cfg config.Config, stateDirectory string) (resul
 	if err != nil {
 		return nil, err
 	}
-	client, err := control.NewClient(control.Config{
-		Location: location, RequestTimeout: cfg.Provider.RequestTimeout.Value(),
-	})
+	providerConfig := kuaifan.Config{Location: location, RequestTimeout: cfg.Provider.RequestTimeout.Value()}
+	iosClient, err := kuaifan.NewIOSClient(providerConfig)
+	if err != nil {
+		return nil, err
+	}
+	windowsClient, err := kuaifan.NewWindowsClient(providerConfig)
 	if err != nil {
 		return nil, err
 	}
 	var runtimeFacade *app.Runtime
-	refresher, err := control.NewRefresher(control.RefresherConfig{
-		Client: client, Manager: manager, SelectorBuilder: coordinator,
+	refresher, err := kuaifan.NewRefresher(kuaifan.RefresherConfig{
+		IOSClient: iosClient, WindowsClient: windowsClient, Manager: manager, SelectorBuilder: coordinator,
 		CommitSnapshot: func(snapshot *state.RuntimeSnapshot) error {
 			if runtimeFacade == nil {
 				return errors.New("runtime snapshot committer unavailable")
@@ -265,7 +268,7 @@ func newAdapterAtStateDirectory(cfg config.Config, stateDirectory string) (resul
 	runtimeFacade, err = app.NewRuntime(app.RuntimeConfig{
 		Manager: manager, Store: store, Refresher: refresher, Subscriptions: subscriptionService,
 		Selectors: coordinator, MutationMu: mutationMu, SocksAddress: proxyAddress, HTTPAddress: managementAddress,
-		Version: version, OSVersion: app.CompatibilityOSVersion, StartedAt: startedAt,
+		Version: version, StartedAt: startedAt,
 		RefreshEvery: cfg.Provider.RefreshInterval.Value(), ProbeTimeout: cfg.Proxy.DialTimeout.Value(),
 	})
 	if err != nil {

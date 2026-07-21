@@ -1,4 +1,4 @@
-package control
+package kuaifan
 
 import (
 	"bytes"
@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	wireprofile "github.com/kfadapter/kfadapter/internal/kuaifan/profile"
 	"io"
 	"net"
 	"net/http"
@@ -21,7 +22,6 @@ import (
 const (
 	defaultAPIHost = "ws.kuaifan.co"
 	defaultAPIBase = "https://" + defaultAPIHost
-	controlUA      = "Mozilla/5.0 (iPhone; CPU iPhone OS 6_0 like Mac OS X) AppleWebKit/536.26 (KHTML, like Gecko) Version/6.0 Mobile/10A403 Safari/8536.25 SPEEDIN"
 
 	maxControlFieldBytes     = 4096
 	maxResponseFields        = 128
@@ -35,6 +35,7 @@ const (
 	maxLocalizedNameEntries  = 8
 	maxLocalizedNameFields   = 4
 	maxLocaleBytes           = 32
+	maxUnixMilli             = int64(253402300799999)
 )
 
 var (
@@ -65,10 +66,11 @@ type Config struct {
 	httpClient *http.Client
 }
 
-// Client sends encrypted requests and validates every response before exposing
-// it to the refresh coordinator. It contains no account, token, or authority
+// Client sends encrypted requests and validates every response according to
+// one immutable provider profile. It contains no account, token, or authority
 // state.
 type Client struct {
+	profile        providerProfile
 	httpClient     *http.Client
 	allowedHosts   map[string]struct{}
 	bootstrapBase  *url.URL
@@ -95,9 +97,13 @@ func (r *lockedReader) Read(data []byte) (int, error) {
 	return r.reader.Read(data)
 }
 
-// NewClient creates a control client. It refuses an insecure or non-allowlisted
-// bootstrap endpoint before making any request.
-func NewClient(cfg Config) (*Client, error) {
+// NewIOSClient creates an iOS control-profile client.
+func NewIOSClient(cfg Config) (*Client, error) { return newClient(cfg, iosClientProfile{}) }
+
+// NewWindowsClient creates a Windows control-profile client.
+func NewWindowsClient(cfg Config) (*Client, error) { return newClient(cfg, windowsClientProfile{}) }
+
+func newClient(cfg Config, profile providerProfile) (*Client, error) {
 	allowed, err := normalizedAllowlist(cfg.AllowedAPIHosts)
 	if err != nil {
 		return nil, err
@@ -145,6 +151,7 @@ func NewClient(cfg Config) (*Client, error) {
 		deadline = 15 * time.Second
 	}
 	return &Client{
+		profile:        profile,
 		httpClient:     &clone,
 		allowedHosts:   allowed,
 		bootstrapBase:  base,
@@ -186,7 +193,7 @@ type ClientConfig struct {
 // An absent or unapproved replacement is deliberately ignored in favor of the
 // documented bootstrap API base.
 func (c *Client) FetchClientConfig(ctx context.Context) (ClientConfig, error) {
-	response, err := c.post(ctx, c.bootstrapBase, "/v4/client/conf.do", map[string]any{"os": "MAC"})
+	response, err := c.post(ctx, c.bootstrapBase, "/v4/client/conf.do", c.profile.configFields())
 	if err != nil {
 		return ClientConfig{}, err
 	}
@@ -212,12 +219,19 @@ func (c *Client) FetchConfig(ctx context.Context) (ClientConfig, error) {
 	return c.FetchClientConfig(ctx)
 }
 
+// AccountProfile is the account metadata validated by user/refresh.do.
+type AccountProfile struct {
+	IsVIP     bool
+	VIPEndsAt time.Time
+}
+
 // LoginSession is provisional credential material. It is kept only in memory
-// and must be completed by authority and lines before snapshot publication.
+// and must be refreshed before authority and line retrieval.
 type LoginSession struct {
 	UserID  int32
 	Token   string
 	APIBase *url.URL
+	Profile AccountProfile
 }
 
 // Login performs configuration selection and then the email/password login.
@@ -231,30 +245,14 @@ func (c *Client) Login(ctx context.Context, input EmailLogin) (LoginSession, err
 }
 
 func (c *Client) loginAt(ctx context.Context, base *url.URL, input EmailLogin) (LoginSession, error) {
-	timestamp := c.timestamp()
-	fields, err := BuildEmailLoginFields(input, timestamp, c.random)
-	if err != nil {
-		return LoginSession{}, err
-	}
-	response, err := c.post(ctx, base, "/v4/user/login.do", fields)
-	// Clear the transient copy as soon as JSON encryption is complete. Go cannot
-	// promise removal of all compiler/runtime copies, but this limits retention.
-	fields.Password = ""
-	if err != nil {
-		return LoginSession{}, err
-	}
-	if *response.Status != 1 && *response.Status != 119 {
-		return LoginSession{}, fmt.Errorf("%w: %d", ErrLoginRejected, *response.Status)
-	}
-	token, err := requiredString(response.Fields, "token")
-	if err != nil {
-		return LoginSession{}, err
-	}
-	userID, err := requiredPositiveInt32(response.Fields, "userId")
-	if err != nil {
-		return LoginSession{}, err
-	}
-	return LoginSession{UserID: userID, Token: token, APIBase: cloneURL(base)}, nil
+	return c.profile.login(ctx, c, base, input)
+}
+
+// RefreshSession validates the login token against user/refresh.do, accepts a
+// rotated token, and captures the authoritative VIP profile. The response must
+// remain bound to the same user before any authority or line request is sent.
+func (c *Client) RefreshSession(ctx context.Context, session LoginSession) (LoginSession, error) {
+	return c.profile.refresh(ctx, c, session)
 }
 
 // Authority is the independently validated authority response. No caller
@@ -271,52 +269,7 @@ type Authority struct {
 // FetchAuthority obtains and decrypts authority using the login token. The
 // returned provider token stays distinct from LoginSession.Token.
 func (c *Client) FetchAuthority(ctx context.Context, session LoginSession) (Authority, error) {
-	if err := c.validateSession(session); err != nil {
-		return Authority{}, err
-	}
-	response, err := c.post(ctx, session.APIBase, "/v4/invpn/getAuthority.do", map[string]any{
-		"userId": session.UserID,
-		"token":  session.Token,
-	})
-	if err != nil {
-		return Authority{}, err
-	}
-	if *response.Status != 1 {
-		return Authority{}, businessStatus(*response.Status)
-	}
-	authKey, err := requiredStringLimit(response.Fields, "authKey", maxAuthorityAuthKeyBytes)
-	if err != nil {
-		return Authority{}, err
-	}
-	providerToken, err := requiredString(response.Fields, "token")
-	if err != nil {
-		return Authority{}, err
-	}
-	var decrypted authorityKey
-	if err := c.authorityCodec.DecodeJSON([]byte(authKey), &decrypted); err != nil {
-		return Authority{}, fmt.Errorf("control: decrypt authority: %w", err)
-	}
-	authorityUserID, err := parsePositiveInt32(decrypted.UserID, true)
-	if err != nil || authorityUserID != session.UserID || decrypted.OrderID == "" || decrypted.EncryptKey == "" || !authorityKeyWithinLimit(decrypted) {
-		return Authority{}, ErrSchema
-	}
-	method := strings.ToLower(decrypted.EncryptType)
-	if method != "aes-256-cfb" {
-		return Authority{}, ErrUnsupportedCipher
-	}
-	userIDText := formatUserID(authorityUserID)
-	providerExtension, err := buildProviderExtension(providerToken, decrypted.OrderID, userIDText)
-	if err != nil {
-		return Authority{}, err
-	}
-	return Authority{
-		UserID:            userIDText,
-		OrderID:           decrypted.OrderID,
-		EncryptKey:        decrypted.EncryptKey,
-		EncryptType:       method,
-		ProviderToken:     providerToken,
-		ProviderExtension: providerExtension,
-	}, nil
+	return c.profile.fetchAuthority(ctx, c, session)
 }
 
 type authorityKey struct {
@@ -332,9 +285,8 @@ type Group struct {
 	Name string
 }
 
-// Line is a validated WIFIIN endpoint. The server's line password is
-// intentionally not retained because the authority encryptKey is the active
-// tunnel password.
+// Line is a validated provider endpoint. Eligibility is profile-specific: the
+// baseline tunnel supports WIFIIN while recovered WS rows remain metadata only.
 type Line struct {
 	Label     string
 	Host      string
@@ -345,6 +297,7 @@ type Line struct {
 	Model     string
 	Weight    int
 	Auto      bool
+	Eligible  bool
 }
 
 // Lines is the validated result of getLines.do.
@@ -355,24 +308,7 @@ type Lines struct {
 
 // FetchLines uses the login token (not the authority provider token).
 func (c *Client) FetchLines(ctx context.Context, session LoginSession) (Lines, error) {
-	if err := c.validateSession(session); err != nil {
-		return Lines{}, err
-	}
-	response, err := c.post(ctx, session.APIBase, "/v4/invpn/getLines.do", map[string]any{
-		"userId":        session.UserID,
-		"token":         session.Token,
-		"time":          c.timestamp(),
-		"os":            "MAC",
-		"clientVersion": "3.3.1",
-		"edition":       "MINOR",
-	})
-	if err != nil {
-		return Lines{}, err
-	}
-	if *response.Status != 1 {
-		return Lines{}, businessStatus(*response.Status)
-	}
-	return validateLinesForLanguage(response.Fields, c.language)
+	return c.profile.fetchLines(ctx, c, session)
 }
 
 type responseEnvelope struct {
@@ -412,7 +348,7 @@ func (c *Client) post(ctx context.Context, base *url.URL, route string, fields a
 		return responseEnvelope{}, fmt.Errorf("control: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json; UTF-8")
-	req.Header.Set("User-Agent", controlUA)
+	req.Header.Set("User-Agent", c.profile.userAgent())
 	response, err := c.httpClient.Do(req)
 	if err != nil {
 		return responseEnvelope{}, fmt.Errorf("control: request: %w", err)
@@ -448,7 +384,7 @@ func requestEnvelope(fields any, language, timestamp string, randomness io.Reade
 		return nil, fmt.Errorf("control: request fields must be an object: %w", err)
 	}
 	payload["lang"] = language
-	nonce, err := boundedRandom(randomness, 100000000)
+	nonce, err := wireprofile.RandomInt(randomness, 100000000)
 	if err != nil {
 		return nil, fmt.Errorf("control: nonce: %w", err)
 	}
@@ -571,6 +507,33 @@ func requiredPositiveInt32(fields map[string]json.RawMessage, name string) (int3
 	return parsePositiveInt32(raw, false)
 }
 
+func requiredBool(fields map[string]json.RawMessage, name string) (bool, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return false, ErrSchema
+	}
+	var value bool
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return false, ErrSchema
+	}
+	return value, nil
+}
+
+func requiredUnixMilli(fields map[string]json.RawMessage, name string) (time.Time, error) {
+	raw, ok := fields[name]
+	if !ok {
+		return time.Time{}, ErrSchema
+	}
+	var value int64
+	if err := json.Unmarshal(raw, &value); err != nil || value < 0 || value > maxUnixMilli {
+		return time.Time{}, ErrSchema
+	}
+	if value == 0 {
+		return time.Time{}, nil
+	}
+	return time.UnixMilli(value).UTC(), nil
+}
+
 // parsePositiveInt32 accepts only a JSON number for login identifiers. Decrypted
 // authority material may encode the same identifier as a JSON string.
 func parsePositiveInt32(raw json.RawMessage, allowString bool) (int32, error) {
@@ -617,7 +580,7 @@ func buildProviderExtension(providerToken, orderID, userID string) (string, erro
 			return "", ErrSchema
 		}
 	}
-	return "|" + providerToken + "|cc.fancast.major|" + orderID + "|" + userID + "|MAC|1.0.46", nil
+	return "|" + providerToken + "|" + wireprofile.IOSPackageName + "|" + orderID + "|" + userID + "|" + wireprofile.IOSProviderDevice + "|" + wireprofile.IOSProviderVersion, nil
 }
 
 func validProviderExtensionField(value string) bool {
@@ -658,6 +621,10 @@ func validateLines(fields map[string]json.RawMessage) (Lines, error) {
 }
 
 func validateLinesForLanguage(fields map[string]json.RawMessage, language string) (Lines, error) {
+	return validateLinesForProfile(fields, language, iosClientProfile{})
+}
+
+func validateLinesForProfile(fields map[string]json.RawMessage, language string, profile providerProfile) (Lines, error) {
 	rawGroups, ok := fields["groups"]
 	if !ok {
 		return Lines{}, ErrSchema
@@ -696,7 +663,7 @@ func validateLinesForLanguage(fields map[string]json.RawMessage, language string
 	}
 	lines := make([]Line, 0, len(lineObjects))
 	for _, object := range lineObjects {
-		line, err := parseLine(object, groupIDs, language)
+		line, err := parseLine(object, groupIDs, language, profile)
 		if err != nil {
 			return Lines{}, err
 		}
@@ -705,7 +672,7 @@ func validateLinesForLanguage(fields map[string]json.RawMessage, language string
 	return Lines{Groups: groups, Lines: lines}, nil
 }
 
-func parseLine(object map[string]json.RawMessage, groupIDs map[string]struct{}, language string) (Line, error) {
+func parseLine(object map[string]json.RawMessage, groupIDs map[string]struct{}, language string, profile providerProfile) (Line, error) {
 	if len(object) > maxLineObjectFields {
 		return Line{}, ErrSchema
 	}
@@ -714,8 +681,12 @@ func parseLine(object map[string]json.RawMessage, groupIDs map[string]struct{}, 
 		return Line{}, ErrInvalidLine
 	}
 	provider, _, err := optionalStringLimit(object, maxLineMetadataBytes, "provider")
-	if err != nil || provider != "WIFIIN" {
+	if err != nil {
 		return Line{}, ErrInvalidLine
+	}
+	eligible, err := profile.validateLine(object, provider)
+	if err != nil {
+		return Line{}, err
 	}
 	groupID, found := objectID(object, "groupId")
 	if !found || !withinLimit(groupID, maxGroupIDBytes) {
@@ -748,7 +719,7 @@ func parseLine(object map[string]json.RawMessage, groupIDs map[string]struct{}, 
 	}
 	weight, _ := integerValue(object["weight"])
 	auto, _ := booleanValue(object["auto"])
-	return Line{Label: label, Host: host, Port: port, Provider: provider, GroupID: groupID, GroupName: groupName, Model: model, Weight: weight, Auto: auto}, nil
+	return Line{Label: label, Host: host, Port: port, Provider: provider, GroupID: groupID, GroupName: groupName, Model: model, Weight: weight, Auto: auto, Eligible: eligible}, nil
 }
 
 func localizedLineName(object map[string]json.RawMessage, preferredLanguage string) (string, bool, error) {
@@ -762,6 +733,7 @@ func localizedLineName(object map[string]json.RawMessage, preferredLanguage stri
 	}
 	fallback := ""
 	preferred := ""
+	preferredLocale := strings.ToLower(strings.ReplaceAll(preferredLanguage, "_", "-"))
 	for _, entry := range entries {
 		if len(entry) == 0 || len(entry) > maxLocalizedNameFields {
 			return "", false, ErrInvalidLine
@@ -788,7 +760,7 @@ func localizedLineName(object map[string]json.RawMessage, preferredLanguage stri
 		if fallback == "" {
 			fallback = name
 		}
-		if language == preferredLanguage && preferred == "" {
+		if strings.ToLower(strings.ReplaceAll(language, "_", "-")) == preferredLocale && preferred == "" {
 			preferred = name
 		}
 	}

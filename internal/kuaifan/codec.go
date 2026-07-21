@@ -1,5 +1,5 @@
-// Package control implements the KuaiFan HTTPS control-plane protocol.
-package control
+// Package kuaifan implements the KuaiFan control plane and tunnel protocols.
+package kuaifan
 
 import (
 	"bytes"

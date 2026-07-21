@@ -15,9 +15,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/kfadapter/kfadapter/internal/kuaifan/wifiin"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/state"
-	"github.com/kfadapter/kfadapter/internal/wifiin"
 )
 
 const (
@@ -530,8 +530,8 @@ func constantTimeEqual(left, right string) bool {
 }
 
 func sameCanonicalNode(left, right state.Node) bool {
-	leftIdentity, leftErr := selector.Canonicalize(selector.NodeIdentity{Provider: left.Provider, Host: left.Host, Port: int(left.Port)})
-	rightIdentity, rightErr := selector.Canonicalize(selector.NodeIdentity{Provider: right.Provider, Host: right.Host, Port: int(right.Port)})
+	leftIdentity, leftErr := selector.Canonicalize(selector.NodeIdentity{NodeID: left.ID, Provider: left.Provider, Host: left.Host, Port: int(left.Port)})
+	rightIdentity, rightErr := selector.Canonicalize(selector.NodeIdentity{NodeID: right.ID, Provider: right.Provider, Host: right.Host, Port: int(right.Port)})
 	return leftErr == nil && rightErr == nil && leftIdentity == rightIdentity
 }
 

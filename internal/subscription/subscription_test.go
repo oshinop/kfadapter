@@ -229,7 +229,7 @@ func TestLegacyExcludedNodeIsRestoredAtStartup(t *testing.T) {
 		{ID: "node-live", Provider: "WIFIIN", Host: "live.example.test", Port: 11001, Name: "Live", Group: "Test", Eligible: true},
 	}
 	for index := range nodes {
-		credential, deriveErr := selector.Derive(selector.NodeIdentity{Provider: nodes[index].Provider, Host: nodes[index].Host, Port: int(nodes[index].Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
+		credential, deriveErr := selector.Derive(selector.NodeIdentity{NodeID: nodes[index].ID, Provider: nodes[index].Provider, Host: nodes[index].Host, Port: int(nodes[index].Port)}, persistent.Subscription.SelectorKey, persistent.Subscription.ProxyAuthKey)
 		if deriveErr != nil {
 			t.Fatal(deriveErr)
 		}
@@ -436,9 +436,9 @@ func TestValidatePersistentStateRejectsTamperedAuthority(t *testing.T) {
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: now, ExpiresAt: now.Add(time.Hour),
-		Account: state.NewAccountSummary("account-one", false, time.Time{}),
-		Session: state.SessionSecrets{UserID: "account-one", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-one|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary("account-one", false, time.Time{}),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: "account-one", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-one|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if _, err := service.CommitRuntimeSnapshot(context.Background(), plan, snapshot); err != nil {
 		t.Fatal(err)

@@ -2,8 +2,6 @@ package app
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"net"
 	"net/http"
@@ -12,7 +10,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/kfadapter/kfadapter/internal/control"
+	"github.com/kfadapter/kfadapter/internal/kuaifan"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/state"
 	"github.com/kfadapter/kfadapter/internal/subscription"
@@ -26,11 +24,6 @@ const (
 	refreshExpirySafetyMargin = 30 * time.Minute
 	refreshRetryAttemptBudget = 5 * time.Minute
 )
-
-// CompatibilityOSVersion is the legacy LSMinimumSystemVersion client
-// fingerprint accepted by the provider. It is fixed so the service never
-// reveals its host operating system.
-const CompatibilityOSVersion = "10.15\n"
 
 var errRuntimeStopped = errors.New("app: runtime stopped")
 
@@ -113,7 +106,7 @@ func (e *loginError) HTTPStatus() int { return e.status }
 
 func classifyLoginError(cause error) error {
 	switch {
-	case errors.Is(cause, control.ErrLoginRejected):
+	case errors.Is(cause, kuaifan.ErrLoginRejected):
 		return &loginError{cause: cause, code: "login_rejected", status: http.StatusUnauthorized}
 	case errors.Is(cause, state.ErrOperationInProgress):
 		return &loginError{cause: cause, code: "operation_in_progress", status: http.StatusConflict}
@@ -123,10 +116,10 @@ func classifyLoginError(cause error) error {
 }
 
 // Refresher is the non-secret control-plane contract Runtime needs. The
-// production control.Refresher satisfies it; the narrow interface makes the
+// production kuaifan.Refresher satisfies it; the narrow interface makes the
 // browser facade testable without a network client.
 type Refresher interface {
-	Login(context.Context, control.EmailLogin) error
+	Login(context.Context, kuaifan.EmailLogin) error
 	Refresh(context.Context) error
 	ExpireIfNeeded(time.Time) (bool, error)
 }
@@ -153,7 +146,6 @@ type RuntimeConfig struct {
 	SocksAddress    string
 	HTTPAddress     string
 	Version         string
-	OSVersion       string
 	StartedAt       time.Time
 	Now             func() time.Time
 	DialContext     func(context.Context, string, string) (net.Conn, error)
@@ -176,7 +168,6 @@ type Runtime struct {
 	socksAddress string
 	httpAddress  string
 	version      string
-	osVersion    string
 	startedAt    time.Time
 	now          func() time.Time
 	dial         func(context.Context, string, string) (net.Conn, error)
@@ -196,12 +187,6 @@ type Runtime struct {
 func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 	if config.Manager == nil || config.Store == nil || config.Refresher == nil || config.Subscriptions == nil || config.Selectors == nil {
 		return nil, errors.New("app: runtime requires manager, store, refresher, subscription service, and selector coordinator")
-	}
-	if config.OSVersion == "" {
-		config.OSVersion = CompatibilityOSVersion
-	}
-	if config.OSVersion != CompatibilityOSVersion {
-		return nil, errors.New("app: unsupported control compatibility version")
 	}
 	if config.Now == nil {
 		config.Now = time.Now
@@ -265,7 +250,7 @@ func NewRuntime(config RuntimeConfig) (*Runtime, error) {
 		manager: config.Manager, store: config.Store, refresher: config.Refresher,
 		subscriptions: config.Subscriptions, selectors: config.Selectors,
 		socksAddress: config.SocksAddress, httpAddress: config.HTTPAddress,
-		version: config.Version, osVersion: config.OSVersion,
+		version:   config.Version,
 		startedAt: config.StartedAt.UTC(), now: config.Now, dial: config.DialContext,
 		probeTimeout: config.ProbeTimeout, probeSlots: make(chan struct{}, config.ProbeConcurrent), mutations: mutationMu,
 		refreshEvery: config.RefreshEvery, lastRefreshAt: lastRefreshAt, nextRefreshAt: nextRefreshAt,
@@ -487,6 +472,7 @@ func (r *Runtime) NodeDetails(_ context.Context, nodeID string) (web.NodeDetails
 		return web.NodeDetails{}, errors.New("app: node selector authority is unavailable")
 	}
 	credentials, authorized := registry.Credentials(ref.Generation, selector.NodeIdentity{
+		NodeID:   node.ID,
 		Provider: node.Provider,
 		Host:     node.Host,
 		Port:     int(node.Port),
@@ -506,10 +492,8 @@ func (r *Runtime) NodeDetails(_ context.Context, nodeID string) (web.NodeDetails
 	}, nil
 }
 
-// Login derives the installation identity and locally administered synthetic
-// MAC solely from protected persistent randomness. It never reads hardware
-// identifiers. The request password reference is dropped before control work;
-// the local control input is dropped as soon as the refresher returns.
+// Login passes only protected installation randomness and transient provider
+// credentials into the KuaiFan boundary. No host identifier is consulted.
 func (r *Runtime) Login(ctx context.Context, input web.LoginInput) (web.Account, error) {
 	if r == nil {
 		return web.Account{}, classifyLoginError(errors.New("runtime unavailable"))
@@ -526,9 +510,8 @@ func (r *Runtime) Login(ctx context.Context, input web.LoginInput) (web.Account,
 	if err != nil {
 		return web.Account{}, classifyLoginError(err)
 	}
-	login := control.EmailLogin{
+	login := kuaifan.EmailLogin{
 		Account: input.Account, Password: input.Password, InstallationID: persistent.InstallationID,
-		MAC: syntheticMAC(persistent.InstallationID), OSVersion: r.osVersion,
 	}
 	input.Password = ""
 	err = r.refresher.Login(ctx, login)
@@ -538,7 +521,7 @@ func (r *Runtime) Login(ctx context.Context, input web.LoginInput) (web.Account,
 		return web.Account{}, classifyLoginError(err)
 	}
 	current := r.manager.Current()
-	if current == nil || !current.Session.Valid() {
+	if current == nil || !current.Sessions.Valid() {
 		return web.Account{}, classifyLoginError(errors.New("login did not publish a complete session"))
 	}
 	account := web.Account{Display: current.Account.Display, IsVIP: current.Account.IsVIP, VIPEndsAt: current.Account.VIPEndsAt}
@@ -598,7 +581,7 @@ func (r *Runtime) Refresh(ctx context.Context) error {
 		return err
 	}
 	current := r.manager.Current()
-	if current == nil || before == nil || current.Generation <= before.Generation || !current.Session.Valid() {
+	if current == nil || before == nil || current.Generation <= before.Generation || !current.Sessions.Valid() {
 		return errors.New("app: refresh did not commit a new complete generation")
 	}
 	r.recordRefresh()
@@ -753,7 +736,7 @@ func (target probeTarget) matches(snapshot *state.RuntimeSnapshot) bool {
 }
 
 func (r *Runtime) updateProbe(current *state.RuntimeSnapshot, nodeID string, health state.NodeHealth, latency time.Duration, observed time.Time) (*state.RuntimeSnapshot, error) {
-	if current == nil || !current.Session.Valid() {
+	if current == nil || !current.Sessions.Valid() {
 		return nil, errors.New("app: no active node snapshot")
 	}
 	next := current.Clone()
@@ -773,23 +756,23 @@ func (r *Runtime) updateProbe(current *state.RuntimeSnapshot, nodeID string, hea
 	return next, nil
 }
 
-// CommitControlSnapshotLocked is control.Refresher's sole final publication
+// CommitControlSnapshotLocked is kuaifan.Refresher's sole final publication
 // callback. Runtime Login and Refresh already hold mutations; it publishes the
 // completed control snapshot while keeping subscription, selector, and runtime
 // authority coherent through compensating rollback.
 func (r *Runtime) CommitControlSnapshotLocked(snapshot *state.RuntimeSnapshot) error {
-	if r == nil || snapshot == nil || !snapshot.Session.Valid() {
+	if r == nil || snapshot == nil || !snapshot.Sessions.Valid() {
 		return errors.New("app: incomplete control snapshot")
 	}
 	if !r.alive.Load() {
 		return errRuntimeStopped
 	}
 	candidate := snapshot.Clone()
-	plan, err := r.subscriptions.PrepareRuntimeCommit(context.Background(), candidate.Session.UserID)
+	plan, err := r.subscriptions.PrepareRuntimeCommit(context.Background(), candidate.Sessions.UserID())
 	if err != nil {
 		return err
 	}
-	rollbackManager, err := r.manager.InstallSubscriptionGeneration(plan.Generation, candidate.Session.UserID)
+	rollbackManager, err := r.manager.InstallSubscriptionGeneration(plan.Generation, candidate.Sessions.UserID())
 	if err != nil {
 		return err
 	}
@@ -960,13 +943,6 @@ func (r *Runtime) publish(kind string, data any) {
 	if r != nil {
 		r.events.publish(web.Event{Type: kind, Data: data})
 	}
-}
-
-func syntheticMAC(installationID string) string {
-	sum := sha256.Sum256([]byte("kfadapter-synthetic-mac\x00" + installationID))
-	bytes := sum[:6]
-	bytes[0] = (bytes[0] | 0x02) &^ 0x01 // local, never multicast
-	return hex.EncodeToString(bytes)
 }
 
 type lifecycleEvent struct {

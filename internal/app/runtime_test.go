@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/kfadapter/kfadapter/internal/control"
+	"github.com/kfadapter/kfadapter/internal/kuaifan"
 	"github.com/kfadapter/kfadapter/internal/selector"
 	"github.com/kfadapter/kfadapter/internal/state"
 	"github.com/kfadapter/kfadapter/internal/subscription"
@@ -35,13 +35,13 @@ func (s *selectorRecorder) SetSelectors(registry *selector.Registry) error {
 
 type inertRefresher struct{}
 
-func (inertRefresher) Login(context.Context, control.EmailLogin) error { return errors.New("not used") }
+func (inertRefresher) Login(context.Context, kuaifan.EmailLogin) error { return errors.New("not used") }
 func (inertRefresher) Refresh(context.Context) error                   { return errors.New("not used") }
 func (inertRefresher) ExpireIfNeeded(time.Time) (bool, error)          { return false, nil }
 
 type expiringRefresher struct{ manager *state.Manager }
 
-func (expiringRefresher) Login(context.Context, control.EmailLogin) error {
+func (expiringRefresher) Login(context.Context, kuaifan.EmailLogin) error {
 	return errors.New("not used")
 }
 func (expiringRefresher) Refresh(context.Context) error { return errors.New("not used") }
@@ -54,12 +54,12 @@ func (r expiringRefresher) ExpireIfNeeded(now time.Time) (bool, error) {
 
 type expiredErrorRefresher struct{}
 
-func (expiredErrorRefresher) Login(context.Context, control.EmailLogin) error {
+func (expiredErrorRefresher) Login(context.Context, kuaifan.EmailLogin) error {
 	return errors.New("not used")
 }
 func (expiredErrorRefresher) Refresh(context.Context) error { return errors.New("not used") }
 func (expiredErrorRefresher) ExpireIfNeeded(time.Time) (bool, error) {
-	return true, control.ErrAuthorityExpired
+	return true, kuaifan.ErrAuthorityExpired
 }
 
 type refreshExpiringRefresher struct {
@@ -67,14 +67,14 @@ type refreshExpiringRefresher struct {
 	now     func() time.Time
 }
 
-func (refreshExpiringRefresher) Login(context.Context, control.EmailLogin) error {
+func (refreshExpiringRefresher) Login(context.Context, kuaifan.EmailLogin) error {
 	return errors.New("not used")
 }
 func (r refreshExpiringRefresher) Refresh(context.Context) error {
 	if err := r.manager.MarkExpired(r.now()); err != nil {
 		return err
 	}
-	return control.ErrAuthorityExpired
+	return kuaifan.ErrAuthorityExpired
 }
 func (refreshExpiringRefresher) ExpireIfNeeded(time.Time) (bool, error) { return false, nil }
 
@@ -295,9 +295,9 @@ func TestAccountChangeFailureRestoresSelectorAuthority(t *testing.T) {
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		Account: state.NewAccountSummary("account-b", false, time.Time{}),
-		Session: state.SessionSecrets{UserID: "account-b", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-b|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary("account-b", false, time.Time{}),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: "account-b", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-b|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if err := fixture.runtime.CommitControlSnapshotLocked(snapshot); err == nil {
 		t.Fatal("account publish unexpectedly succeeded")
@@ -342,9 +342,9 @@ func TestRuntimeCommitFailureRestoresPersistentAggregate(t *testing.T) {
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		Account: state.NewAccountSummary("account-a", false, time.Time{}),
-		Session: state.SessionSecrets{UserID: "account-a", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-a|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary("account-a", false, time.Time{}),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: "account-a", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-a|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if err := fixture.runtime.CommitControlSnapshotLocked(snapshot); err == nil {
 		t.Fatal("ineligible snapshot unexpectedly committed")
@@ -395,7 +395,7 @@ func TestSameAccountRuntimeCommitKeepsSelectorCredentials(t *testing.T) {
 	service := newAtomicSubscription(t, store)
 	fixture := newRuntimeFixture(t, store, service)
 	before := fixture.coordinator.Registry()
-	identity := selector.NodeIdentity{Provider: "WIFIIN", Host: "node.example.test", Port: 1080}
+	identity := selector.NodeIdentity{NodeID: "node", Provider: "WIFIIN", Host: "node.example.test", Port: 1080}
 	oldCredentials, ok := before.Credentials(persistent.Subscription.Generation, identity)
 	if !ok {
 		t.Fatal("initial selector credentials unavailable")
@@ -416,9 +416,9 @@ func TestSameAccountRuntimeCommitKeepsSelectorCredentials(t *testing.T) {
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		Account: state.NewAccountSummary("account-a", false, time.Time{}),
-		Session: state.SessionSecrets{UserID: "account-a", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-a|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary("account-a", false, time.Time{}),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: "account-a", LoginToken: "login", ProviderToken: "provider", TunnelPassword: "tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|provider|cc.fancast.major|order|account-a|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if err := fixture.runtime.CommitControlSnapshotLocked(snapshot); err != nil {
 		t.Fatalf("same-account commit: %v", err)
@@ -428,17 +428,17 @@ func TestSameAccountRuntimeCommitKeepsSelectorCredentials(t *testing.T) {
 	if !ok || oldCredentials != newCredentials {
 		t.Fatalf("same account changed selector credentials: before=%#v after=%#v", oldCredentials, newCredentials)
 	}
-	if current := fixture.manager.Current(); current == nil || current.Session.UserID != "account-a" {
+	if current := fixture.manager.Current(); current == nil || current.Sessions.IOS.UserID != "account-a" {
 		t.Fatalf("same-account commit did not publish session: %#v", current)
 	}
 	persisted, err := store.Load()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if persisted.ActiveSession == nil || persisted.ActiveSession.Generation != snapshot.Generation || persisted.ActiveSession.Account != snapshot.Account || persisted.ActiveSession.Session != snapshot.Session {
+	if persisted.ActiveSession == nil || persisted.ActiveSession.Generation != snapshot.Generation || persisted.ActiveSession.Account != snapshot.Account || persisted.ActiveSession.Sessions != snapshot.Sessions {
 		t.Fatalf("same-account commit did not persist complete session: %#v", persisted.ActiveSession)
 	}
-	if persisted.LastGood.Generation != persisted.Subscription.Generation || len(persisted.LastGood.Nodes) != len(persisted.ActiveSession.Nodes) || !persisted.MatchesAccount(persisted.ActiveSession.Session.UserID) {
+	if persisted.LastGood.Generation != persisted.Subscription.Generation || len(persisted.LastGood.Nodes) != len(persisted.ActiveSession.Nodes) || !persisted.MatchesAccount(persisted.ActiveSession.Sessions.UserID()) {
 		t.Fatalf("committed SQLite aggregate is inconsistent: %#v", persisted)
 	}
 	for _, reference := range persisted.ActiveSession.Selectors {
@@ -464,7 +464,7 @@ func TestRuntimeNodeDetailsUsesCurrentSelectorAuthority(t *testing.T) {
 		t.Fatal(err)
 	}
 	fixture := newRuntimeFixture(t, store, newAtomicSubscription(t, store))
-	identity := selector.NodeIdentity{Provider: "WIFIIN", Host: "node.example.test", Port: 1080}
+	identity := selector.NodeIdentity{NodeID: "node", Provider: "WIFIIN", Host: "node.example.test", Port: 1080}
 	complete, err := fixture.manager.Begin(state.OperationLogin)
 	if err != nil {
 		t.Fatal(err)
@@ -481,9 +481,9 @@ func TestRuntimeNodeDetailsUsesCurrentSelectorAuthority(t *testing.T) {
 	}
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: time.Now().UTC(), ExpiresAt: time.Now().Add(time.Hour).UTC(),
-		Account: state.NewAccountSummary("account-a", false, time.Time{}),
-		Session: state.SessionSecrets{UserID: "account-a", LoginToken: "session-login-token", ProviderToken: "session-provider-token", TunnelPassword: "session-tunnel-password", TunnelMethod: "aes-256-cfb", ProviderExtension: "|session-provider-token|cc.fancast.major|order|account-a|MAC|1.0.46"},
-		Nodes:   built.Nodes, Selectors: built.Selectors,
+		Account:  state.NewAccountSummary("account-a", false, time.Time{}),
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{UserID: "account-a", LoginToken: "session-login-token", ProviderToken: "session-provider-token", TunnelPassword: "session-tunnel-password", TunnelMethod: "aes-256-cfb", ProviderExtension: "|session-provider-token|cc.fancast.major|order|account-a|MAC|1.0.46"}},
+		Nodes:    built.Nodes, Selectors: built.Selectors,
 	}
 	if err := fixture.runtime.CommitControlSnapshotLocked(snapshot); err != nil {
 		t.Fatalf("CommitControlSnapshotLocked: %v", err)
@@ -555,10 +555,10 @@ func seedDurableRuntimeSession(t *testing.T, store *state.SQLiteStore, createdAt
 	snapshot := &state.RuntimeSnapshot{
 		Generation: 1, CreatedAt: createdAt, ExpiresAt: expiresAt,
 		Account: state.NewAccountSummary("expiry-account", false, time.Time{}),
-		Session: state.SessionSecrets{
+		Sessions: state.ClientSessions{IOS: state.SessionSecrets{
 			UserID: "expiry-account", LoginToken: "expiry-login", ProviderToken: "expiry-provider",
 			TunnelPassword: "expiry-tunnel", TunnelMethod: "aes-256-cfb", ProviderExtension: "|expiry-provider|cc.fancast.major|order|expiry-account|MAC|1.0.46",
-		},
+		}},
 		Nodes: built.Nodes, Selectors: built.Selectors,
 	}
 	if _, err := store.Update(func(candidate *state.PersistentState) error {
@@ -598,7 +598,7 @@ func TestHeartbeatClearsNewlyExpiredDurableSession(t *testing.T) {
 		t.Fatalf("Heartbeat: %v", err)
 	}
 	current := fixture.manager.Current()
-	if fixture.manager.State() != state.StateExpired || current == nil || current.Session.Valid() {
+	if fixture.manager.State() != state.StateExpired || current == nil || current.Sessions.Valid() {
 		t.Fatalf("heartbeat manager state = %s, current = %#v", fixture.manager.State(), current)
 	}
 	persistent, err := store.Load()
@@ -617,7 +617,7 @@ func TestHeartbeatClearsDurableSessionWhenExpiryReportsError(t *testing.T) {
 	fixture := newRuntimeFixture(t, store, nil)
 	fixture.runtime.refresher = expiredErrorRefresher{}
 	err := fixture.runtime.Heartbeat(context.Background(), false)
-	if !errors.Is(err, control.ErrAuthorityExpired) {
+	if !errors.Is(err, kuaifan.ErrAuthorityExpired) {
 		t.Fatalf("Heartbeat error = %v", err)
 	}
 	persistent, loadErr := store.Load()
@@ -636,7 +636,7 @@ func TestRefreshClearsDurableSessionWhenAuthorityExpires(t *testing.T) {
 	fixture := newRuntimeFixture(t, store, nil)
 	fixture.runtime.refresher = refreshExpiringRefresher{manager: fixture.manager, now: func() time.Time { return now.Add(time.Hour) }}
 	err := fixture.runtime.Refresh(context.Background())
-	if !errors.Is(err, control.ErrAuthorityExpired) {
+	if !errors.Is(err, kuaifan.ErrAuthorityExpired) {
 		t.Fatalf("Refresh error = %v", err)
 	}
 	persistent, loadErr := store.Load()

@@ -1,4 +1,4 @@
-package control
+package kuaifan
 
 import (
 	"bytes"
@@ -16,6 +16,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	wireprofile "github.com/kfadapter/kfadapter/internal/kuaifan/profile"
 )
 
 type roundTripFunc func(*http.Request) (*http.Response, error)
@@ -46,7 +48,7 @@ func TestClientUsesHTTPSAllowlistHeadersAndDistinctTokens(t *testing.T) {
 		if got := request.Header.Get("Content-Type"); got != "application/json; UTF-8" {
 			t.Errorf("Content-Type = %q", got)
 		}
-		if got := request.Header.Get("User-Agent"); got != controlUA {
+		if got := request.Header.Get("User-Agent"); got != wireprofile.IOSUserAgent {
 			t.Errorf("User-Agent = %q", got)
 		}
 		encoded, err := io.ReadAll(request.Body)
@@ -65,6 +67,8 @@ func TestClientUsesHTTPSAllowlistHeadersAndDistinctTokens(t *testing.T) {
 			return encryptedHTTPResponse(t, map[string]any{"status": 1, "msg": "", "fields": map[string]any{"domain": map[string]any{"ws": "api.example"}}}), nil
 		case "/v4/user/login.do":
 			return encryptedHTTPResponse(t, map[string]any{"status": 119, "msg": "", "fields": map[string]any{"token": "login-token", "userId": 7}}), nil
+		case "/v4/user/refresh.do":
+			return encryptedHTTPResponse(t, envelope(map[string]any{"userId": 7, "token": "refreshed-login-token", "isVip": true, "vipEndTime": int64(1784661133000)})), nil
 		case "/v4/invpn/getAuthority.do":
 			authKey, err := AuthorityCodec().EncodeJSON(map[string]any{
 				"userId": "7", "partnerKey": "p", "encryptKey": "tunnel-key", "encryptType": "AES-256-CFB", "partnerStatus": "ok", "orderId": "order-4",
@@ -83,7 +87,7 @@ func TestClientUsesHTTPSAllowlistHeadersAndDistinctTokens(t *testing.T) {
 		}
 	})
 	fixedTime := time.Date(2026, 7, 15, 10, 11, 12, 123000000, time.UTC)
-	client, err := NewClient(Config{
+	client, err := NewIOSClient(Config{
 		httpClient:      &http.Client{Transport: transport},
 		BootstrapBase:   "https://bootstrap.example",
 		AllowedAPIHosts: []string{"bootstrap.example", "api.example"},
@@ -94,9 +98,13 @@ func TestClientUsesHTTPSAllowlistHeadersAndDistinctTokens(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	session, err := client.Login(context.Background(), EmailLogin{Account: "alice@example.test", Password: "password", InstallationID: "install-id", OSVersion: "test-os"})
+	session, err := client.Login(context.Background(), EmailLogin{Account: "alice@example.test", Password: "password", InstallationID: "install-id"})
 	if err != nil {
 		t.Fatalf("Login: %v", err)
+	}
+	session, err = client.RefreshSession(context.Background(), session)
+	if err != nil {
+		t.Fatalf("RefreshSession: %v", err)
 	}
 	authority, err := client.FetchAuthority(context.Background(), session)
 	if err != nil {
@@ -112,37 +120,76 @@ func TestClientUsesHTTPSAllowlistHeadersAndDistinctTokens(t *testing.T) {
 	if len(lines.Lines) != 1 || lines.Lines[0].Host != "node.example" || lines.Lines[0].Port != 11000 {
 		t.Fatalf("validated lines = %#v", lines)
 	}
+	if session.Token != "refreshed-login-token" || !session.Profile.IsVIP || session.Profile.VIPEndsAt.UnixMilli() != 1784661133000 {
+		t.Fatalf("refreshed session = %#v", session)
+	}
 
 	mu.Lock()
 	defer mu.Unlock()
 	login := requests["api.example/v4/user/login.do"]
-	if login["deviceId"] != "install-id" || login["udid"] != "install-id" || login["openUdid"] != "install-id" || login["uuid"] != "install-id" || login["idfa"] != "install-id" {
-		t.Fatalf("installation identifier fields diverged: %#v", login)
+	if deviceID, ok := login["deviceId"].(string); !ok || len(deviceID) != 40 || login["openUdid"] != deviceID || login["uuid"] != "install-id" || login["udid"] != "" || login["idfa"] != "" || login["imei"] != "" {
+		t.Fatalf("installation identifier profile = %#v", login)
 	}
-	if login["loginType"] != float64(4) || login["imei"] != "" || login["userId"] != "" || login["mac"] != DefaultSyntheticMAC {
-		t.Fatalf("email schema is not privacy-safe: %#v", login)
+	if login["loginType"] != float64(4) || login["userId"] != "" || login["mac"] != wireprofile.DefaultSyntheticMAC || login["os"] != "IOS" || login["edition"] != "THIRD" || login["clientVersion"] != "4.18.4" || login["deviceType"] != "iPhone" || login["virtualMachine"] != false || login["withSimCard"] != true {
+		t.Fatalf("email schema does not match captured iOS profile: %#v", login)
 	}
 	for route, fields := range requests {
 		if fields["lang"] != "zh-CN" || len(fields["nonce"].(string)) != 8 || fields["time"] != "20260715101112123" {
 			t.Fatalf("common envelope on %s = %#v", route, fields)
 		}
 	}
-	if authorityRequest := requests["api.example/v4/invpn/getAuthority.do"]; authorityRequest["token"] != "login-token" {
-		t.Fatalf("authority token = %q, want login token", authorityRequest["token"])
+	if configRequest := requests["bootstrap.example/v4/client/conf.do"]; configRequest["os"] != "IOS" {
+		t.Fatalf("config request profile = %#v", configRequest)
 	}
-	if linesRequest := requests["api.example/v4/invpn/getLines.do"]; linesRequest["token"] != "login-token" {
-		t.Fatalf("lines token = %q, want login token", linesRequest["token"])
+	if refreshRequest := requests["api.example/v4/user/refresh.do"]; refreshRequest["token"] != "login-token" || refreshRequest["userId"] != float64(7) {
+		t.Fatalf("refresh session request = %#v", refreshRequest)
+	}
+	if authorityRequest := requests["api.example/v4/invpn/getAuthority.do"]; authorityRequest["token"] != "refreshed-login-token" {
+		t.Fatalf("authority token = %q, want refreshed login token", authorityRequest["token"])
+	}
+	if linesRequest := requests["api.example/v4/invpn/getLines.do"]; linesRequest["token"] != "refreshed-login-token" || linesRequest["os"] != "IOS" || linesRequest["clientVersion"] != "4.18.4" || linesRequest["edition"] != "THIRD" {
+		t.Fatalf("lines request profile = %#v", linesRequest)
+	}
+}
+
+func TestRefreshSessionRejectsInvalidIdentityAndProfile(t *testing.T) {
+	t.Parallel()
+	valid := map[string]any{"userId": 7, "token": "refreshed", "isVip": true, "vipEndTime": int64(1784661133000)}
+	tests := map[string]map[string]any{
+		"different user":  {"userId": 8, "token": "refreshed", "isVip": true, "vipEndTime": int64(1784661133000)},
+		"non-boolean VIP": {"userId": 7, "token": "refreshed", "isVip": 1, "vipEndTime": int64(1784661133000)},
+		"fractional end":  {"userId": 7, "token": "refreshed", "isVip": true, "vipEndTime": 1.5},
+		"VIP without end": {"userId": 7, "token": "refreshed", "isVip": true, "vipEndTime": int64(0)},
+	}
+	for name, fields := range tests {
+		name, fields := name, fields
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			client, err := NewIOSClient(Config{
+				BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"},
+				httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+					return encryptedHTTPResponse(t, envelope(fields)), nil
+				})},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			session := LoginSession{UserID: 7, Token: "login", APIBase: mustBase(t, "https://api.example")}
+			if _, err := client.RefreshSession(context.Background(), session); !errors.Is(err, ErrSchema) {
+				t.Fatalf("RefreshSession error = %v, want ErrSchema; valid baseline %#v", err, valid)
+			}
+		})
 	}
 }
 
 func TestClientRejectsInsecureOrUnapprovedAPIBase(t *testing.T) {
 	t.Parallel()
 	for _, base := range []string{"http://ws.kuaifan.co", "https://attacker.example", "https://ws.kuaifan.co/path", "https://ws.kuaifan.co?x=1"} {
-		if _, err := NewClient(Config{BootstrapBase: base}); !errors.Is(err, ErrUnapprovedAPIBase) {
-			t.Errorf("NewClient(%q) error = %v, want ErrUnapprovedAPIBase", base, err)
+		if _, err := NewIOSClient(Config{BootstrapBase: base}); !errors.Is(err, ErrUnapprovedAPIBase) {
+			t.Errorf("NewIOSClient(%q) error = %v, want ErrUnapprovedAPIBase", base, err)
 		}
 	}
-	client, err := NewClient(Config{BootstrapBase: "https://ws.kuaifan.co"})
+	client, err := NewIOSClient(Config{BootstrapBase: "https://ws.kuaifan.co"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -156,7 +203,7 @@ func TestClientRejectsInsecureOrUnapprovedAPIBase(t *testing.T) {
 	if _, err := client.APIBase("http://ws.kuaifan.co"); !errors.Is(err, ErrUnapprovedAPIBase) {
 		t.Fatalf("HTTP API base error = %v", err)
 	}
-	if _, err := NewClient(Config{BootstrapBase: "https://ws.kuaifan.co", httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}}); !errors.Is(err, ErrInsecureTLS) {
+	if _, err := NewIOSClient(Config{BootstrapBase: "https://ws.kuaifan.co", httpClient: &http.Client{Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}}}}); !errors.Is(err, ErrInsecureTLS) {
 		t.Fatalf("insecure TLS client error = %v", err)
 	}
 }
@@ -205,7 +252,7 @@ func TestHardenedHTTPClientBypassesEnvironmentProxies(t *testing.T) {
 }
 
 func TestAPIBaseRequiresCanonicalExplicitPort(t *testing.T) {
-	client, err := NewClient(Config{BootstrapBase: "https://bootstrap.example", AllowedAPIHosts: []string{"bootstrap.example", "api.example"}})
+	client, err := NewIOSClient(Config{BootstrapBase: "https://bootstrap.example", AllowedAPIHosts: []string{"bootstrap.example", "api.example"}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -231,7 +278,7 @@ func TestAPIBaseRequiresCanonicalExplicitPort(t *testing.T) {
 	}
 	for _, domain := range []string{"api.example:0", "api.example:65536", "api.example:000443", "api.example:", "api.example:01", "api.example:abc"} {
 		t.Run(domain, func(t *testing.T) {
-			fallback, err := NewClient(Config{
+			fallback, err := NewIOSClient(Config{
 				BootstrapBase: "https://bootstrap.example", AllowedAPIHosts: []string{"bootstrap.example", "api.example"},
 				httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 					return encryptedHTTPResponse(t, envelope(map[string]any{"domain": map[string]any{"ws": domain}})), nil
@@ -267,7 +314,7 @@ func TestExplicitAPIAllowlistDoesNotInjectDefaultHost(t *testing.T) {
 		t.Fatalf("custom allowlist unexpectedly contains default host: %#v", customHosts)
 	}
 	calls := 0
-	if _, err := NewClient(Config{
+	if _, err := NewIOSClient(Config{
 		BootstrapBase: "https://ws.kuaifan.co", AllowedAPIHosts: []string{"api.example"},
 		httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			calls++
@@ -276,10 +323,10 @@ func TestExplicitAPIAllowlistDoesNotInjectDefaultHost(t *testing.T) {
 	}); !errors.Is(err, ErrUnapprovedAPIBase) || calls != 0 {
 		t.Fatalf("excluded bootstrap error/calls = %v/%d", err, calls)
 	}
-	if _, err := NewClient(Config{BootstrapBase: "https://ws.kuaifan.co", AllowedAPIHosts: []string{"api.example", "ws.kuaifan.co"}}); err != nil {
+	if _, err := NewIOSClient(Config{BootstrapBase: "https://ws.kuaifan.co", AllowedAPIHosts: []string{"api.example", "ws.kuaifan.co"}}); err != nil {
 		t.Fatalf("explicit default allowlist host rejected: %v", err)
 	}
-	client, err := NewClient(Config{BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"API.EXAMPLE."}})
+	client, err := NewIOSClient(Config{BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"API.EXAMPLE."}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -308,7 +355,7 @@ func TestAuthorityRejectsInvalidProviderExtensionFields(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			client, err := NewClient(Config{
+			client, err := NewIOSClient(Config{
 				BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"},
 				httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 					return encryptedHTTPResponse(t, envelope(map[string]any{"authKey": string(authKey), "token": test.providerToken})), nil
@@ -332,7 +379,7 @@ func TestClientRejectsMalformedOversizedAuthorityAndLines(t *testing.T) {
 	t.Parallel()
 	base := "https://api.example"
 	makeClient := func(responder func(*http.Request) *http.Response) *Client {
-		client, err := NewClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		client, err := NewIOSClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(request *http.Request) (*http.Response, error) {
 			return responder(request), nil
 		})}, BootstrapBase: base, AllowedAPIHosts: []string{"api.example"}, Random: bytes.NewReader(bytes.Repeat([]byte{1}, 64))})
 		if err != nil {
@@ -383,7 +430,7 @@ func TestResponseMessageIsOptionalButBounded(t *testing.T) {
 		{"status": 1, "fields": map[string]any{}},
 	}
 	for index, payload := range accepted {
-		client, err := NewClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		client, err := NewIOSClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return encryptedHTTPResponse(t, payload), nil
 		})}, BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"}})
 		if err != nil {
@@ -397,7 +444,7 @@ func TestResponseMessageIsOptionalButBounded(t *testing.T) {
 		{"status": 1, "msg": strings.Repeat("m", maxControlFieldBytes+1), "fields": map[string]any{}},
 		{"status": 1, "msg": map[string]any{"not": "a string"}, "fields": map[string]any{}},
 	} {
-		client, err := NewClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		client, err := NewIOSClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return encryptedHTTPResponse(t, payload), nil
 		})}, BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"}})
 		if err != nil {
@@ -411,7 +458,7 @@ func TestResponseMessageIsOptionalButBounded(t *testing.T) {
 
 func TestNullResponseFieldsReachEndpointStatusHandling(t *testing.T) {
 	clientFor := func(payload map[string]any) *Client {
-		client, err := NewClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+		client, err := NewIOSClient(Config{httpClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return encryptedHTTPResponse(t, payload), nil
 		})}, BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"}})
 		if err != nil {
@@ -420,7 +467,7 @@ func TestNullResponseFieldsReachEndpointStatusHandling(t *testing.T) {
 		return client
 	}
 	base := mustBase(t, "https://api.example")
-	input := EmailLogin{Account: "a@example.test", Password: "password", InstallationID: "install", OSVersion: "test"}
+	input := EmailLogin{Account: "a@example.test", Password: "password", InstallationID: "install"}
 	if _, err := clientFor(map[string]any{"status": 0, "msg": nil, "fields": nil}).loginAt(context.Background(), base, input); !errors.Is(err, ErrLoginRejected) {
 		t.Fatalf("null-field login rejection = %v", err)
 	}
@@ -465,12 +512,12 @@ func TestNumericUserIDIsPreservedOnAuthorityAndLines(t *testing.T) {
 			return nil, errors.New("unexpected route")
 		}
 	})
-	client, err := NewClient(Config{httpClient: &http.Client{Transport: transport}, BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"}})
+	client, err := NewIOSClient(Config{httpClient: &http.Client{Transport: transport}, BootstrapBase: "https://api.example", AllowedAPIHosts: []string{"api.example"}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	base := mustBase(t, "https://api.example")
-	session, err := client.loginAt(context.Background(), base, EmailLogin{Account: "a@example.test", Password: "password", InstallationID: "install", OSVersion: "test"})
+	session, err := client.loginAt(context.Background(), base, EmailLogin{Account: "a@example.test", Password: "password", InstallationID: "install"})
 	if err != nil || session.UserID != userID {
 		t.Fatalf("numeric login session = %#v, %v", session, err)
 	}
@@ -531,7 +578,7 @@ func TestLocalizedLineNamePreferenceFallbackAndBounds(t *testing.T) {
 	}
 	name := []any{
 		map[string]any{"language": "en-US", "name": "Tokyo"},
-		map[string]any{"language": "zh-CN", "name": "东京"},
+		map[string]any{"language": "zh_cn", "name": "东京"},
 	}
 	lines, err := validateLines(withNames(name))
 	if err != nil || len(lines.Lines) != 1 || lines.Lines[0].Label != "东京" {
@@ -612,10 +659,10 @@ func TestLineSchemaCaps(t *testing.T) {
 }
 
 func TestControlSecretAndAccountStringCaps(t *testing.T) {
-	if _, err := BuildEmailLoginFields(EmailLogin{Account: strings.Repeat("a", maxControlFieldBytes+1), Password: "p", InstallationID: "id"}, "20260715101112123", bytes.NewReader([]byte{0, 0, 0, 0})); !errors.Is(err, ErrInvalidVerifyInput) {
+	if _, err := (wireprofile.IOS{}).BuildLoginFields(wireprofile.LoginInput{Account: strings.Repeat("a", maxControlFieldBytes+1), Password: "p", InstallationID: "id"}, "20260715101112123", bytes.NewReader([]byte{0, 0, 0, 0})); !errors.Is(err, wireprofile.ErrInvalidVerifyInput) {
 		t.Fatalf("over-cap account error = %v", err)
 	}
-	if _, err := BuildEmailLoginFields(EmailLogin{Account: "a@example.test", Password: strings.Repeat("p", maxControlFieldBytes+1), InstallationID: "id"}, "20260715101112123", bytes.NewReader([]byte{0, 0, 0, 0})); !errors.Is(err, ErrInvalidVerifyInput) {
+	if _, err := (wireprofile.IOS{}).BuildLoginFields(wireprofile.LoginInput{Account: "a@example.test", Password: strings.Repeat("p", maxControlFieldBytes+1), InstallationID: "id"}, "20260715101112123", bytes.NewReader([]byte{0, 0, 0, 0})); !errors.Is(err, wireprofile.ErrInvalidVerifyInput) {
 		t.Fatalf("over-cap password error = %v", err)
 	}
 	if _, err := requiredString(map[string]json.RawMessage{"token": json.RawMessage(strconv.Quote(strings.Repeat("t", maxControlFieldBytes+1)))}, "token"); !errors.Is(err, ErrSchema) {
